@@ -1,0 +1,95 @@
+generator client {
+  provider     = "prisma-client"
+  output       = "../generated/prisma"
+  moduleFormat = "cjs"
+}
+
+datasource db {
+  provider = "sqlite"
+}
+
+model User {
+  id               String            @id @default(cuid())
+  telegramId       String            @unique
+  name             String?
+  timezone         String            @default("Asia/Jakarta")
+  createdAt        DateTime          @default(now()) @map("created_at")
+  updatedAt        DateTime          @updatedAt @map("updated_at")
+  googleConnection GoogleConnection?
+  scheduledTasks   ScheduledTask[]
+  tasks            Task[]
+  userPreferences  UserPreference?
+
+  @@map("users")
+}
+
+model GoogleConnection {
+  id           String   @id @default(cuid())
+  userId       String   @unique @map("user_id")
+  accessToken  String   @map("access_token")
+  refreshToken String   @map("refresh_token")
+  expiresAt    DateTime @map("expires_at")
+  createdAt    DateTime @default(now()) @map("created_at")
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("google_connections")
+}
+
+model Task {
+  id              String          @id @default(cuid())
+  userId          String          @map("user_id")
+  title           String
+  description     String?
+  durationMinutes Int             @map("duration_minutes")
+  deadline        DateTime?
+  priority        TaskPriority    @default(NORMAL)
+  status          TaskStatus      @default(PENDING)
+  createdAt       DateTime        @default(now()) @map("created_at")
+  updatedAt       DateTime        @updatedAt @map("updated_at")
+  scheduledTasks  ScheduledTask[]
+  user            User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("tasks")
+}
+
+model ScheduledTask {
+  id              String     @id @default(cuid())
+  taskId          String     @map("task_id")
+  userId          String     @map("user_id")
+  startTime       DateTime   @map("start_time")
+  endTime         DateTime   @map("end_time")
+  calendarEventId String?    @map("calendar_event_id")
+  status          TaskStatus @default(SCHEDULED)
+  createdAt       DateTime   @default(now()) @map("created_at")
+  user            User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  task            Task       @relation(fields: [taskId], references: [id], onDelete: Cascade)
+
+  @@map("scheduled_tasks")
+}
+
+model UserPreference {
+  id             String   @id @default(cuid())
+  userId         String   @unique @map("user_id")
+  preferredStart Int?     @map("preferred_start_time")
+  preferredEnd   Int?     @map("preferred_end_time")
+  maxDailyHours  Int?     @map("max_daily_hours")
+  createdAt      DateTime @default(now()) @map("created_at")
+  updatedAt      DateTime @updatedAt @map("updated_at")
+  user           User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("user_preferences")
+}
+
+enum TaskStatus {
+  PENDING
+  SCHEDULED
+  COMPLETED
+  CANCELLED
+}
+
+enum TaskPriority {
+  LOW
+  NORMAL
+  HIGH
+  URGENT
+}
