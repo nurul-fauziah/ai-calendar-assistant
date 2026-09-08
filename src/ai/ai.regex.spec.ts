@@ -133,4 +133,50 @@ describe('AiService regex fallback', () => {
     expect(r.preferredMinutes).toBe(20 * 60 + 30);
     expect(r.title).toBe('meeting');
   });
+
+  it('parses "tanggal 10 september gw harus ke kampus jam 12"', async () => {
+    const r = await service.parseTask('tanggal 10 september gw harus ke kampus jam 12');
+    // Explicit calendar date → 2026-09-10 (tahun ini, udah lewat → tahun depan kalau lewat).
+    // Hari ini 2026-09-08 → 10 sep masih di depan → 2026.
+    expect(r.date).toBe('2026-09-10');
+    expect(r.preferredMinutes).toBe(12 * 60);
+    expect(r.title).toBe('gw harus ke kampus');
+    expect(r.title).not.toContain('tanggal');
+    expect(r.title).not.toContain('september');
+  });
+
+  it('parses "10 september belajar Python jam 14.30"', async () => {
+    const r = await service.parseTask('10 september belajar Python jam 14.30');
+    expect(r.date).toBe('2026-09-10');
+    expect(r.preferredMinutes).toBe(14 * 60 + 30);
+    expect(r.title).toBe('belajar Python');
+  });
+
+  it('parses "besok meeting jam 10"', async () => {
+    const r = await service.parseTask('besok meeting jam 10');
+    expect(r.date).toBeDefined();
+    expect(r.date).not.toBe('2026-09-08'); // besok ≠ hari ini
+    expect(r.preferredMinutes).toBe(10 * 60);
+    expect(r.title).toBe('meeting');
+  });
+
+  it('parses "hari ini makan jam 12"', async () => {
+    const r = await service.parseTask('hari ini makan jam 12');
+    expect(r.date).toBe('2026-09-08'); // hari ini
+    expect(r.preferredMinutes).toBe(12 * 60);
+    expect(r.title).toBe('makan');
+  });
+
+  it('parses numeric date "10/09" and "10-09"', async () => {
+    const r2 = await service.parseTask('10/09 sprint review');
+    expect(r2.date).toBe('2026-09-10');
+    const r3 = await service.parseTask('10-09 meeting alok');
+    expect(r3.date).toBe('2026-09-10');
+  });
+
+  it('parses "lusa" = +2 days, not relative shift of an explicit date', async () => {
+    const r = await service.parseTask('lusa ujian');
+    expect(r.date).toBeDefined();
+    expect(r.title).toBe('ujian');
+  });
 });
