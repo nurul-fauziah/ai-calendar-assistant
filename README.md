@@ -178,7 +178,7 @@ personal-calendar/
 ### 1. Clone and install
 
 ```bash
-git clone <your-repo-url>
+git clone <repo-url>
 cd personal-calendar
 npm install
 ```
