@@ -5,6 +5,7 @@ import { UsersService } from '../users/users.service';
 import { AiService } from '../ai/ai.service';
 import { SchedulerService } from '../scheduler/scheduler.service';
 import { CalendarService } from '../calendar/calendar.service';
+import { format, fromZonedTime, toZonedTime } from 'date-fns-tz';
 import {
   TelegramUpdate,
   TelegramWebhookResponse,
@@ -36,9 +37,26 @@ export class TelegramService implements OnModuleInit {
       } catch (err) {
         this.logger.warn(`Failed to set webhook: ${(err as Error).message}`);
       }
+      try {
+        await this.setCommands();
+      } catch (err) {
+        this.logger.warn(`Failed to set commands: ${(err as Error).message}`);
+      }
     } else {
       this.logger.warn('TELEGRAM_BOT_TOKEN or TELEGRAM_WEBHOOK_URL not set');
     }
+  }
+
+  // Daftar command yang muncul pas user ketik "/" di chat.
+  private async setCommands(): Promise<void> {
+    await axios.post(`${this.getBotUrl()}/setMyCommands`, {
+      commands: [
+        { command: 'start', description: 'Mulai / sapa bot' },
+        { command: 'today', description: 'Jadwal hari ini' },
+        { command: 'week', description: 'Ringkasan minggu ini' },
+        { command: 'connect', description: 'Hubungkan Google Calendar' },
+      ],
+    });
   }
 
   getBotUrl(): string {
@@ -84,13 +102,14 @@ export class TelegramService implements OnModuleInit {
     }
 
     if (text === '/today') {
-      const today = new Date();
-      const start = new Date(today);
-      start.setHours(0, 0, 0, 0);
-      const end = new Date(start);
-      end.setHours(23, 59, 59, 999);
+      const tz = await this.users.getTimezone(user.id);
+      const now = new Date();
+      const todayLocal = toZonedTime(now, tz);
+      const todayStr = format(todayLocal, 'yyyy-MM-dd', { timeZone: tz });
+      const start = fromZonedTime(`${todayStr}T00:00:00`, tz);
+      const end = fromZonedTime(`${todayStr}T23:59:59`, tz);
       const events = await this.calendar.getEvents(user.id, start, end);
-      const msg = this.calendar.buildTodaySummary(events);
+      const msg = this.calendar.buildTodaySummary(events, tz);
       return this.sendText(message.chat.id, msg);
     }
 
@@ -104,14 +123,24 @@ export class TelegramService implements OnModuleInit {
     }
 
     if (text === '/week') {
-      const today = new Date();
-      const start = new Date(today);
-      start.setHours(0, 0, 0, 0);
-      start.setDate(start.getDate() - start.getDay());
-      const end = new Date(start);
-      end.setDate(end.getDate() + 7);
-      const events = await this.calendar.getEvents(user.id, start, end);
-      const msg = this.calendar.buildWeekSummary(events);
+      const tz = await this.users.getTimezone(user.id);
+      // Senin = awal minggu lokal user. Hitung offset hari via getDay dari
+      // zona user, lalu geser string tanggal lokal (bukan mutasi Date yang
+      // ikut zona host).
+      const todayLocal = toZonedTime(new Date(), tz);
+      const todayStr = format(todayLocal, 'yyyy-MM-dd', { timeZone: tz });
+      const dow = todayLocal.getDay(); // 0=Minggu, 1=Senin
+      const offset = (dow + 6) % 7; // mundur ke Senin
+      const mondayStr = format(
+        fromZonedTime(`${todayStr}T12:00:00`, tz).getTime() - offset * 24 * 60 * 60 * 1000,
+        'yyyy-MM-dd',
+        { timeZone: tz },
+      );
+      const start = fromZonedTime(`${mondayStr}T00:00:00`, tz);
+      const end = fromZonedTime(`${mondayStr}T23:59:59`, tz);
+      const endOfWeek = new Date(end.getTime() + 6 * 24 * 60 * 60 * 1000);
+      const events = await this.calendar.getEvents(user.id, start, endOfWeek);
+      const msg = this.calendar.buildWeekSummary(events, tz);
       return this.sendText(message.chat.id, msg);
     }
 
@@ -120,8 +149,10 @@ export class TelegramService implements OnModuleInit {
       // Send typing indicator
       await this.sendAction(message.chat.id, 'typing');
 
-      // Parse task via AI
-      const parsed = await this.ai.parseTask(text);
+      // Parse task via AI, pake timezone user biar relatif (besok/hari ini)
+      // nggak salah di zona server.
+      const tz = await this.users.getTimezone(user.id);
+      const parsed = await this.ai.parseTask(text, tz);
       if (parsed.intent === 'CREATE_TASK') {
         // Get available slots
         const slots = await this.schedulerService.findAvailableSlots(user.id, parsed);

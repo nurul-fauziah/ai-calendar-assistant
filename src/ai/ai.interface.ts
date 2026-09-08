@@ -14,6 +14,8 @@ export interface ParsedTask {
   deadline?: string;
   priority?: Priority;
   preferredTime?: TimePreference;
+  /** Jam mulai spesifik yang user minta (0-23), mis. "jam 1 siang" = 13. */
+  preferredHour?: number;
   date?: string;
   recurrence?: string;
 }

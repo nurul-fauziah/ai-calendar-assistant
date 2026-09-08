@@ -19,4 +19,12 @@ export class UsersService {
   async findById(id: string): Promise<User | null> {
     return this.prisma.user.findUnique({ where: { id } });
   }
+
+  async getTimezone(id: string): Promise<string> {
+    const user = await this.prisma.user.findUnique({
+      where: { id },
+      select: { timezone: true },
+    });
+    return user?.timezone || 'Asia/Jakarta';
+  }
 }

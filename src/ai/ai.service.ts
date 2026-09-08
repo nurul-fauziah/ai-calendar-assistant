@@ -1,6 +1,7 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import axios from 'axios';
+import { format, fromZonedTime, toZonedTime } from 'date-fns-tz';
 import { ParsedTask, Priority } from './ai.interface';
 
 @Injectable()
@@ -14,17 +15,17 @@ export class AiService {
     this.apiUrl = config.get<string>('LLM_API_URL') || 'https://api.openai.com/v1/chat/completions';
   }
 
-  async parseTask(text: string): Promise<ParsedTask> {
+  async parseTask(text: string, timezone?: string): Promise<ParsedTask> {
     // If LLM configured, use it
     if (this.apiKey) {
-      return this.parseWithLLM(text);
+      return this.parseWithLLM(text, timezone);
     }
 
     // Fallback: regex-based parser
-    return this.parseWithRegex(text);
+    return this.parseWithRegex(text, timezone);
   }
 
-  private async parseWithLLM(text: string): Promise<ParsedTask> {
+  private async parseWithLLM(text: string, timezone?: string): Promise<ParsedTask> {
     const prompt = [
       'Kamu adalah AI assistant untuk personal calendar. Ekstrak informasi dari teks berikut.',
       'Kamu HARUS merespons dalam format JSON valid saja, tidak ada teks tambahan.',
@@ -35,10 +36,11 @@ export class AiService {
       '- deadline: "YYYY-MM-DD" (tanggal deadline, gunakan YYYY-MM-DD)',
       '- priority: "LOW" | "NORMAL" | "HIGH" | "URGENT"',
       '- preferredTime: "MORNING" | "AFTERNOON" | "EVENING" | "NIGHT" | null',
+      '- preferredHour: number | null (jam mulai SPESIFIK yang diminta, 0-23. "jam 1 siang" = 13, "jam 9 pagi" = 9, "13:00" = 13. null kalau nggak ada)',
       '- date: "YYYY-MM-DD" (tanggal mulai jika ada)',
       '- recurrence: string (misal "daily", "weekly", "monthly") | undefined',
       'Contoh:',
-      `{"intent": "CREATE_TASK", "title": "Belajar Java", "durationMinutes": 120, "deadline": "2026-08-20", "priority": "NORMAL", "preferredTime": null}`,
+      `{"intent": "CREATE_TASK", "title": "Belajar Java", "durationMinutes": 120, "deadline": "2026-08-20", "priority": "NORMAL", "preferredTime": null, "preferredHour": null}`,
       `Teks: "${text}"`,
       'JSON:',
     ].join('\n');
@@ -77,7 +79,7 @@ export class AiService {
    * Supports: "belajar Python 2 jam besok", "besok belajar Java 1.5 jam",
    * "meeting minggu depan 30 menit", etc.
    */
-  private parseWithRegex(text: string): ParsedTask {
+  private parseWithRegex(text: string, timezone?: string): ParsedTask {
     const lower = text.toLowerCase().trim();
 
     // Detect recurrence
@@ -106,10 +108,24 @@ export class AiService {
       }
     }
 
-    // Parse date/deadline
+    // Parse date/deadline. Semua relatif (hari ini/besok/minggu depan) harus
+    // dihitung dari tanggal LOKAL user, bukan zona host. Host UTC di malam
+    // hari (mis. 05:00 WIB) masih "kemarin" secara UTC → kalau nggak,
+    // "besok" salah jadinya hari ini.
     let deadline: string | undefined;
     let date: string | undefined;
-    const today = new Date();
+    const tz = timezone || 'Asia/Jakarta';
+    const todayStr = format(new Date(), 'yyyy-MM-dd', { timeZone: tz });
+    const todayWeekday = toZonedTime(new Date(), tz).getDay();
+
+    // Tambah/geser hari pada string tanggal lokal (noon biar aman dari DST).
+    const shiftLocal = (mins: number): string =>
+      format(
+        fromZonedTime(`${todayStr}T12:00:00`, tz).getTime() + mins * 60000,
+        'yyyy-MM-dd',
+        { timeZone: tz },
+      );
+    const dayMs = 24 * 60;
 
     const dayMap: Record<string, number> = {
       'senin': 1, 'selasa': 2, 'rabu': 3, 'kamis': 4,
@@ -117,39 +133,36 @@ export class AiService {
     };
 
     // Relative dates
-    let targetDate: Date | undefined;
+    let target: string | undefined;
 
     if (lower.includes('hari ini') || lower.includes('sekarang') || lower.includes('today')) {
-      targetDate = new Date(today);
+      target = todayStr;
     } else if (lower.includes('besok') || lower.includes('tomorrow')) {
-      targetDate = new Date(today);
-      targetDate.setDate(targetDate.getDate() + 1);
+      target = shiftLocal(dayMs);
     } else if (lower.includes('minggu depan') || lower.includes('next week')) {
-      targetDate = new Date(today);
-      targetDate.setDate(targetDate.getDate() + 7);
+      target = shiftLocal(7 * dayMs);
     } else if (lower.includes('minggu ini')) {
-      targetDate = new Date(today);
-      targetDate.setDate(targetDate.getDate() - today.getDay());
+      target = shiftLocal(-todayWeekday * dayMs);
     } else if (lower.includes('bulan depan') || lower.includes('next month')) {
-      targetDate = new Date(today);
-      targetDate.setMonth(targetDate.getMonth() + 1);
+      target = shiftLocal(30 * dayMs);
     }
 
     // Day of week names
-    for (const [dayName, dayNum] of Object.entries(dayMap)) {
-      const regex = new RegExp(`\\b${dayName}\\b`);
-      if (regex.test(lower)) {
-        targetDate = new Date(today);
-        const diff = (dayNum - today.getDay() + 7) % 7;
-        targetDate.setDate(targetDate.getDate() + diff);
-        break;
+    if (!target) {
+      for (const [dayName, dayNum] of Object.entries(dayMap)) {
+        const regex = new RegExp(`\\b${dayName}\\b`);
+        if (regex.test(lower)) {
+          const diff = (dayNum - todayWeekday + 7) % 7;
+          target = todayStr;
+          if (diff !== 0) target = shiftLocal(diff * dayMs);
+          break;
+        }
       }
     }
 
-    if (targetDate) {
-      const iso = targetDate.toISOString().split('T')[0];
-      date = iso;
-      deadline = iso;
+    if (target) {
+      date = target;
+      deadline = target;
     }
 
     // Priority keywords
@@ -174,10 +187,30 @@ export class AiService {
       preferredTime = 'NIGHT';
     }
 
+    // Parse jam spesifik yang diminta, mis:
+    //   "jam 1" / "jam 1 siang" / "pukul 15" / "13:00" / "jam 1 sore" / "3pm"
+    // Periode (pagi/siang/sore/malam) menentukan offset +12 untuk jam 1-11.
+    let preferredHour: number | undefined;
+    const hourMatch = /(?:\b|pukul\s+|jam\s+)(\d{1,2})(?::(\d{2}))?\s*(pagi|siang|sore|malam)?(?:\b|$)/i.exec(text);
+    if (hourMatch && /(jam|pukul|:)/i.test(hourMatch[0])) {
+      let h = parseInt(hourMatch[1], 10);
+      const period = hourMatch[3];
+      if (period === 'siang' || period === 'sore' || period === 'malam') {
+        if (h < 12) h += 12;
+      } else {
+        // "jam 1" / "jam 3" tanpa periode = siang/sore, bukan subuh.
+        // Jam 1-7 umumnya selalu PM dalam ucapan sehari-hari.
+        if (h >= 1 && h <= 7) h += 12;
+      }
+      if (h >= 0 && h <= 23) preferredHour = h;
+    }
+
     // Extract title: strip known keywords, keep remaining as title
     let title = text
       .replace(/\d+[\.,]?\d*\s*jam(?:\s*\d+[\.,]?\d*\s*menit)?/g, '')
       .replace(/\d+\s*menit/g, '')
+      .replace(/(?:jam|pukul)\s+\d{1,2}(?::\d{2})?\s*(?:pagi|siang|sore|malam)?/gi, '')
+      .replace(/\d{1,2}:\d{2}/g, '')
       .replace(/\b(besok|minggu depan|minggu ini|bulan depan|hari ini|sekarang|tomorrow|next week|next month|today)\b/g, '')
       .replace(/\b(setiap hari|setiap minggu|setiap bulan|daily|weekly|monthly|tiap minggu|tiap bulan)\b/g, '')
       .replace(/\b(urgent|penting|high|low|rendah|opsional|morning|afternoon|evening|night|pagi|siang|sore|malam|kritis|darurat)\b/g, '')
@@ -199,6 +232,7 @@ export class AiService {
       deadline,
       priority: priority as Priority,
       preferredTime,
+      preferredHour,
       date,
       recurrence,
     };

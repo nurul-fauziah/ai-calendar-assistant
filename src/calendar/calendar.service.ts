@@ -1,6 +1,7 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import axios from 'axios';
+import { format } from 'date-fns-tz';
 import { PrismaService } from '../common/prisma.service';
 import { encryptToken, decryptToken } from '../common/crypto.util';
 import { escapeHtml } from '../common/html-escape';
@@ -68,18 +69,25 @@ export class CalendarService {
       const token = await this.getValidToken(userId);
       if (!token) throw new Error('Google Calendar not connected');
 
+      // Kirim sebagai wall-clock local user (tanpa Z), bukan UTC ISO. Kalau
+      // kirim toISOString() + timeZone, Google baca ulang string itu sebagai
+      // UTC → "jam 13 WIB" jadi "jam 13 UTC" = jadwal geser 7 jam.
+      const tz = await this.getTimezone(userId);
+      const localStart = format(event.start, "yyyy-MM-dd'T'HH:mm:ss", { timeZone: tz });
+      const localEnd = format(event.end, "yyyy-MM-dd'T'HH:mm:ss", { timeZone: tz });
+
       const res = await axios.post(
         'https://www.googleapis.com/calendar/v3/calendars/primary/events',
         {
           summary: event.summary,
           description: event.description,
           start: {
-            dateTime: event.start.toISOString(),
-            timeZone: 'Asia/Jakarta',
+            dateTime: localStart,
+            timeZone: tz,
           },
           end: {
-            dateTime: event.end.toISOString(),
-            timeZone: 'Asia/Jakarta',
+            dateTime: localEnd,
+            timeZone: tz,
           },
           recurrence: event.recurrence,
         },
@@ -96,29 +104,52 @@ export class CalendarService {
     }
   }
 
-  buildTodaySummary(events: CalendarEvent[]): string {
+  private async getTimezone(userId: string): Promise<string> {
+    const user = await this.prisma.user.findUnique({
+      where: { id: userId },
+      select: { timezone: true },
+    });
+    return user?.timezone || 'Asia/Jakarta';
+  }
+
+  buildTodaySummary(events: CalendarEvent[], tz = 'Asia/Jakarta'): string {
     let msg = '📅 <b>Today</b>\n\n';
     if (events.length === 0) {
       msg += '📭 Nggak ada jadwal hari ini.';
     } else {
-      for (const e of events) {
-        const ts = e.start.toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit' });
-        const te = e.end.toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit' });
+      const sorted = [...events].sort((a, b) => a.start.getTime() - b.start.getTime());
+      for (const e of sorted) {
+        const ts = format(e.start, 'HH:mm', { timeZone: tz });
+        const te = format(e.end, 'HH:mm', { timeZone: tz });
         msg += `${ts} – ${te}\n${escapeHtml(e.summary)}\n\n`;
       }
     }
     return msg;
   }
 
-  buildWeekSummary(events: CalendarEvent[]): string {
+  buildWeekSummary(events: CalendarEvent[], tz = 'Asia/Jakarta'): string {
     let msg = '📅 <b>This Week</b>\n\n';
     if (events.length === 0) {
       msg += '📭 Nggak ada jadwal minggu ini.';
     } else {
+      // Kelompokkan per hari lokal user biar nggak muncul 2x buat hari sama.
+      const byDay = new Map<string, CalendarEvent[]>();
       for (const e of events) {
-        const day = e.start.toLocaleDateString('id-ID', { weekday: 'long' });
-        const time = e.start.toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit' });
-        msg += `${day}\n${time} ${escapeHtml(e.summary)}\n\n`;
+        const key = format(e.start, 'yyyy-MM-dd', { timeZone: tz });
+        const list = byDay.get(key) || [];
+        list.push(e);
+        byDay.set(key, list);
+      }
+      const sortedDays = [...byDay.entries()].sort((a, b) => a[0].localeCompare(b[0]));
+      for (const [day, list] of sortedDays) {
+        const label = format(new Date(`${day}T00:00:00`), 'EEEE, dd MMM', { timeZone: tz });
+        msg += `\n<b>${label}</b>\n`;
+        list
+          .sort((a, b) => a.start.getTime() - b.start.getTime())
+          .forEach((e) => {
+            const time = format(e.start, 'HH:mm', { timeZone: tz });
+            msg += `${time} ${escapeHtml(e.summary)}\n`;
+          });
       }
     }
     return msg;
