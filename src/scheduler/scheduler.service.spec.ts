@@ -21,6 +21,10 @@ describe('SchedulerService', () => {
       update: jest.fn(),
       deleteMany: jest.fn(),
     },
+    task: {
+      findUnique: jest.fn().mockResolvedValue({ id: 't1' }),
+      update: jest.fn(),
+    },
   };
   const calendar = {
     getEvents: jest.fn().mockResolvedValue([]),
@@ -109,6 +113,41 @@ describe('SchedulerService', () => {
     const local = first.start.getUTCHours() * 60 + first.start.getUTCMinutes();
     // 11:50 WIB = 04:50Z
     expect(local).toBe(4 * 60 + 50);
+  });
+
+  it('preserves exact requested time (14:50) when free', async () => {
+    prisma.scheduledTask.findMany.mockResolvedValue([]);
+    const slots = await service.findAvailableSlots('user-1', {
+      intent: 'CREATE_TASK',
+      title: 'harus tidur',
+      preferredMinutes: 14 * 60 + 50, // 14:50 WIB
+    });
+
+    // Nggak boleh mulai 15:00 — harus 14:50 WIB = 07:50Z
+    const first = slots[0];
+    const utc = first.start.getUTCHours() * 60 + first.start.getUTCMinutes();
+    expect(utc).toBe(7 * 60 + 50);
+  });
+
+  it('shifts only when requested time conflicts, with a notice', async () => {
+    // Busy di 14:50-15:50 WIB (07:50Z-08:50Z) hari ini
+    const dayKey = new Date().toISOString().split('T')[0];
+    const busyStart = `${dayKey}T07:50:00.000Z`;
+    const busyEnd = `${dayKey}T08:50:00.000Z`;
+    prisma.scheduledTask.findMany.mockResolvedValue([
+      { startTime: new Date(busyStart), endTime: new Date(busyEnd) },
+    ]);
+    const slots = await service.findAvailableSlots('user-1', {
+      intent: 'CREATE_TASK',
+      title: 'harus tidur',
+      durationMinutes: 30,
+      preferredMinutes: 14 * 60 + 50,
+    });
+
+    // Slot harus bergeser SETELAH busy (bukan mulai 14:50). 15:50 WIB = 08:50Z
+    const first = slots[0];
+    const utc = first.start.getUTCHours() * 60 + first.start.getUTCMinutes();
+    expect(utc).toBe(8 * 60 + 50);
   });
 
   it('rejects confirm when another task overlaps that slot', async () => {

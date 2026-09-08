@@ -107,4 +107,30 @@ describe('AiService regex fallback', () => {
     expect(result.title).toBe('meeting');
     expect(result.title).not.toContain('jam');
   });
+
+  it('parses "hari ini jam 14.50 harus tidur" → 14:50, no invented duration', async () => {
+    const r = await service.parseTask('hari ini jam 14.50 harus tidur');
+    expect(r.date).toBeDefined();
+    expect(r.preferredMinutes).toBe(14 * 60 + 50);
+    expect(r.title).toBe('harus tidur');
+    expect(r.durationMinutes).toBeUndefined();
+  });
+
+  it('parses "hari ini jam 14:50 harus tidur" → 14:50', async () => {
+    const r = await service.parseTask('hari ini jam 14:50 harus tidur');
+    expect(r.preferredMinutes).toBe(14 * 60 + 50);
+    expect(r.title).toBe('harus tidur');
+  });
+
+  it('parses "besok jam 8 pagi belajar" → 08:00', async () => {
+    const r = await service.parseTask('besok jam 8 pagi belajar');
+    expect(r.preferredMinutes).toBe(8 * 60);
+    expect(r.title).toBe('belajar');
+  });
+
+  it('parses "besok jam 20.30 meeting" → 20:30', async () => {
+    const r = await service.parseTask('besok jam 20.30 meeting');
+    expect(r.preferredMinutes).toBe(20 * 60 + 30);
+    expect(r.title).toBe('meeting');
+  });
 });

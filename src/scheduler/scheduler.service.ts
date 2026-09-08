@@ -18,6 +18,10 @@ export class SchedulerService {
   private readonly logger = new Logger(SchedulerService.name);
   private telegramService!: TelegramService;
 
+  // Default durasi kalau user nggak sebut. Eksplisit & terdokumentasi
+  // (bukan "invent 1 jam"): dipakai konsisten buat slot & pesan.
+  private static readonly DEFAULT_DURATION_MINUTES = 60;
+
   // State modify pending per user (in-memory; bot single-instance).
   // Map<userId, { schedId, taskId }>. User yang lagi proses modify nggak
   // boleh nimpa/numpuk — cukup satu alur aktif.
@@ -123,13 +127,17 @@ export class SchedulerService {
         ? addMinutes(dayStartAbs, parsed.preferredMinutes)
         : addMinutes(dayStartAbs, 8 * 60);
       const workEndAbs = addMinutes(dayStartAbs, 22 * 60);
-      // Jangan kasih slot sebelum sekarang di hari ini
+      // Jangan kasih slot sebelum sekarang di hari ini. Kalau user minta
+      // jam spesifik ("14:50") dan itu masih di depan → mulai TEPAT di
+      // 14:50. Kalau udah lewat / bentrok, c = geser ke now/after-busy
+      // dan sendRecommendation ngasih tau.
+      const dur = durationMinutes ?? SchedulerService.DEFAULT_DURATION_MINUTES;
       let c = workStartAbs > now ? workStartAbs : now;
       for (const ev of dayEvents) {
         if (ev.start > c && ev.start <= workEndAbs) {
           const gapEnd = ev.start > workEndAbs ? workEndAbs : ev.start;
           const gap = (gapEnd.getTime() - c.getTime()) / 60000;
-          if (gap >= (durationMinutes || 30)) {
+          if (gap >= dur) {
             slots.push({ start: new Date(c), end: gapEnd, availableMinutes: gap });
           }
         }
@@ -137,7 +145,7 @@ export class SchedulerService {
       }
       if (c < workEndAbs) {
         const gap = (workEndAbs.getTime() - c.getTime()) / 60000;
-        if (gap >= (durationMinutes || 30)) {
+        if (gap >= dur) {
           slots.push({ start: new Date(c), end: workEndAbs, availableMinutes: gap });
         }
       }
@@ -171,7 +179,8 @@ export class SchedulerService {
     existingTaskId?: string,
   ) {
     const tz = await this.getTimezone(userId);
-    const duration = parsed.durationMinutes || 60;
+    const now = new Date();
+    const duration = parsed.durationMinutes ?? SchedulerService.DEFAULT_DURATION_MINUTES;
     const selectedSlots = slots.slice(0, 3).filter((s) => s.availableMinutes >= duration);
 
     if (selectedSlots.length === 0) {
@@ -179,6 +188,21 @@ export class SchedulerService {
         chatId,
         'Gue nggak nemu slot yang cukup panjang. Kurangin durasi atau perpanjang deadline?',
       );
+    }
+
+    // Kalau user minta jam spesifik tapi slot pertama nggak mulai di jam
+    // itu, berarti diminta udah lewat / bentrok → kasih tau + saran.
+    let startNotice = '';
+    if (parsed.preferredMinutes !== undefined && selectedSlots[0]) {
+      const asked = parsed.preferredMinutes;
+      const got = toLocal(selectedSlots[0].start, tz).getHours() * 60 +
+        toLocal(selectedSlots[0].start, tz).getMinutes();
+      if (got !== asked) {
+        const askedStr = `${String(Math.floor(asked / 60)).padStart(2, '0')}:${String(asked % 60).padStart(2, '0')}`;
+        startNotice =
+          `⚠️ <b>Jam ${askedStr} nggak bisa</b> (${selectedSlots[0].start <= now ? 'udah lewat' : 'bentrok sama jadwal lain'}). ` +
+          `Slot terdekat:\n`;
+      }
     }
 
     let remaining = duration;
@@ -217,6 +241,7 @@ export class SchedulerService {
     }
 
     let text = `📅 <b>Schedule Recommendation</b>\n\n`;
+    if (startNotice) text += startNotice + '\n';
     text += `📌 <b>${escapeHtml(parsed.title || 'Untitled')}</b>\n`;
     text += `Duration: ${Math.round(duration / 60)}h${duration % 60}\n`;
     if (parsed.deadline) {
