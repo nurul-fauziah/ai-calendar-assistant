@@ -98,6 +98,11 @@ export class TelegramService implements OnModuleInit {
     }
 
     if (text === '/start' || text === '/start@calendar_assistant_bot') {
+      // Reset semua state sesi: pending modify + thread rekomendasi lama +
+      // rekomendasi PENDING di DB yang nggak pernah dikonfirmasi. Biar
+      // update berikutnya nggak nyambung ke rekomendasi lama / ngasih
+      // "slot bentrok" gara-gara rekomendasi basi.
+      await this.schedulerService?.resetConversation(user.id);
       return this.sendText(message.chat.id, this.getStartMessage());
     }
 
@@ -231,13 +236,14 @@ export class TelegramService implements OnModuleInit {
     inlineKeyboard: {
       inline_keyboard: Array<Array<{ text: string; callback_data: string }>>;
     },
-  ) {
-    await axios.post(`${this.getBotUrl()}/sendMessage`, {
+  ): Promise<{ messageId?: number }> {
+    const res = await axios.post(`${this.getBotUrl()}/sendMessage`, {
       chat_id: chatId,
       text,
       parse_mode: 'HTML',
       reply_markup: inlineKeyboard,
     });
+    return { messageId: res.data?.result?.message_id };
   }
 
   async editMessage(

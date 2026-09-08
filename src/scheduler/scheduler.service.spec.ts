@@ -5,7 +5,6 @@ import { CalendarService } from '../calendar/calendar.service';
 import { TelegramService } from '../telegram/telegram.service';
 import { TasksService } from '../tasks/tasks.service';
 import { AiService } from '../ai/ai.service';
-import { ConfigService } from '@nestjs/config';
 
 describe('SchedulerService', () => {
   let service: SchedulerService;
@@ -14,7 +13,7 @@ describe('SchedulerService', () => {
       findUnique: jest.fn().mockResolvedValue({ timezone: 'Asia/Jakarta' }),
     },
     scheduledTask: {
-      create: jest.fn(),
+      create: jest.fn().mockImplementation(({ data }) => Promise.resolve({ id: 'sched-new', ...data })),
       findUnique: jest.fn(),
       findMany: jest.fn(),
       findFirst: jest.fn(),
@@ -32,8 +31,9 @@ describe('SchedulerService', () => {
   };
   const telegram = {
     sendText: jest.fn().mockResolvedValue(undefined),
-    sendRecommendation: jest.fn().mockResolvedValue(undefined),
+    sendRecommendation: jest.fn().mockResolvedValue({ messageId: 100 }),
     sendAction: jest.fn().mockResolvedValue(undefined),
+    editMessage: jest.fn().mockResolvedValue(undefined),
   };
 
   beforeEach(async () => {
@@ -45,7 +45,16 @@ describe('SchedulerService', () => {
         { provide: CalendarService, useValue: calendar },
         { provide: TelegramService, useValue: telegram },
         { provide: TasksService, useValue: { createTask: jest.fn() } },
-        { provide: AiService, useValue: { parseTask: jest.fn() } },
+        {
+          provide: AiService,
+          useValue: {
+            // Default: parser sukses → CREATE_TASK. Tests spesifik override.
+            parseTask: jest.fn().mockResolvedValue({
+              intent: 'CREATE_TASK',
+              preferredMinutes: 15 * 60 + 50,
+            }),
+          },
+        },
       ],
     }).compile();
 
@@ -129,13 +138,42 @@ describe('SchedulerService', () => {
     expect(utc).toBe(7 * 60 + 50);
   });
 
-  it('shifts only when requested time conflicts, with a notice', async () => {
-    // Busy di 14:50-15:50 WIB (07:50Z-08:50Z) hari ini
+  it('shifts only when a CONFIRMED (SCHEDULED) task conflicts', async () => {
+    // Kunci "sekarang" biar deterministik (11:00 WIB = 04:00Z).
+    const nowSpy = jest.spyOn(Date, 'now').mockReturnValue(Date.parse('2026-09-08T04:00:00.000Z'));
+    try {
+      // Busy CONFIRMED mulai TEPAT di 14:50 WIB (06:50Z-07:50Z = 14:50-15:50 WIB)
+      const dayKey = '2026-09-08';
+      const busyStart = `${dayKey}T06:50:00.000Z`;
+      const busyEnd = `${dayKey}T07:50:00.000Z`;
+      prisma.scheduledTask.findMany.mockResolvedValue([
+        { status: 'SCHEDULED', startTime: new Date(busyStart), endTime: new Date(busyEnd) },
+      ]);
+      // Default durasi 60 menit — nggak muat di gap 14:40-an, jadi shift ke 15:50.
+      const slots = await service.findAvailableSlots('user-1', {
+        intent: 'CREATE_TASK',
+        title: 'harus tidur',
+        preferredMinutes: 14 * 60 + 50,
+      });
+
+      // Slot harus bergeser SETELAH busy. 15:50 WIB = 07:50Z = 470 menit.
+      const first = slots[0];
+      const utc = first.start.getUTCHours() * 60 + first.start.getUTCMinutes();
+      expect(utc).toBe(7 * 60 + 50);
+    } finally {
+      nowSpy.mockRestore();
+    }
+  });
+
+  it('does NOT treat unconfirmed PENDING recommendation as busy', async () => {
+    // Rekomendasi lama yang belum dikonfirmasi (PENDING) BUKAN blocker —
+    // ini akar kenapa dulu saran loncat ke 16:50/19:00: rekomendasi basi
+    // ikut dihitung "bentrok".
     const dayKey = new Date().toISOString().split('T')[0];
     const busyStart = `${dayKey}T07:50:00.000Z`;
     const busyEnd = `${dayKey}T08:50:00.000Z`;
     prisma.scheduledTask.findMany.mockResolvedValue([
-      { startTime: new Date(busyStart), endTime: new Date(busyEnd) },
+      { status: 'PENDING', startTime: new Date(busyStart), endTime: new Date(busyEnd) },
     ]);
     const slots = await service.findAvailableSlots('user-1', {
       intent: 'CREATE_TASK',
@@ -144,10 +182,9 @@ describe('SchedulerService', () => {
       preferredMinutes: 14 * 60 + 50,
     });
 
-    // Slot harus bergeser SETELAH busy (bukan mulai 14:50). 15:50 WIB = 08:50Z
     const first = slots[0];
     const utc = first.start.getUTCHours() * 60 + first.start.getUTCMinutes();
-    expect(utc).toBe(8 * 60 + 50);
+    expect(utc).toBe(7 * 60 + 50); // 14:50 WIB — nggak ke-block PENDING
   });
 
   it('rejects confirm when another task overlaps that slot', async () => {
@@ -171,5 +208,132 @@ describe('SchedulerService', () => {
     expect(prisma.scheduledTask.update).not.toHaveBeenCalled();
     expect(calendar.createEvent).not.toHaveBeenCalled();
     expect(telegram.sendText).toHaveBeenCalledWith(999, expect.stringContaining('bentrok'));
+  });
+
+  // ── Flow regression tests ─────────────────────────────────────────────
+
+  it('/start resets conversation state', async () => {
+    // Set pending modify + latestRecommendation sebagai "before" state.
+    service['pendingModify'].set('user-1', { schedId: 'old', taskId: 't-old', chatId: 999 });
+    service['latestRecommendation'].set('user-1', { schedId: 'old', taskId: 't-old', chatId: 999, messageId: 42 });
+
+    // Wire lazy + jalankan resetConversation.
+    prisma.scheduledTask.deleteMany.mockResolvedValue({ count: 2 });
+    await service['onModuleInit']();
+    await service.resetConversation('user-1');
+
+    expect(service.hasPendingModify('user-1')).toBe(false);
+    expect(service['latestRecommendation'].has('user-1')).toBe(false);
+    expect(prisma.scheduledTask.deleteMany).toHaveBeenCalledWith({
+      where: { userId: 'user-1', status: 'PENDING' },
+    });
+  });
+
+  it('preserves 13:50 exactly when free', async () => {
+    prisma.scheduledTask.findMany.mockResolvedValue([]);
+    // "gw mau makan jam 13.50" → preferredMinutes = 13*60+50 = 830
+    const slots = await service.findAvailableSlots('user-1', {
+      intent: 'CREATE_TASK',
+      title: 'makan',
+      preferredMinutes: 13 * 60 + 50,
+    });
+    expect(slots.length).toBeGreaterThan(0);
+    const first = slots[0];
+    // 13:50 WIB = 06:50Z = 410 UTC-minutes
+    const utcMin = first.start.getUTCHours() * 60 + first.start.getUTCMinutes();
+    expect(utcMin).toBe(6 * 60 + 50);
+  });
+
+  it('modify edits the same message (editMessage, no extra sendText)', async () => {
+    prisma.scheduledTask.findMany.mockResolvedValue([]);
+    prisma.scheduledTask.deleteMany.mockResolvedValue({ count: 0 });
+    prisma.task.update.mockResolvedValue({});
+    // Wire lazy telegramService.
+    await service['onModuleInit']();
+
+    // Simulasi rekomendasi awal sudah ada, user klik Modify.
+    service['latestRecommendation'].set('user-1', {
+      schedId: 'sched-1',
+      taskId: 't1',
+      chatId: 999,
+      messageId: 42,
+    });
+
+    prisma.scheduledTask.findUnique.mockResolvedValue({
+      id: 'sched-1',
+      userId: 'user-1',
+      status: 'PENDING',
+      startTime: new Date('2026-09-08T06:00:00.000Z'),
+      endTime: new Date('2026-09-08T07:00:00.000Z'),
+      taskId: 't1',
+      task: { title: 'Makan', description: '', priority: 'NORMAL', durationMinutes: 60, deadline: null },
+    });
+
+    await service.modifySchedule(999, 'user-1', 'sched-1');
+
+    // Modify harus EDIT pesan rekomendasi asli (id=42), nggak bikin pesan baru.
+    expect(telegram.editMessage).toHaveBeenCalledWith(999, 42, expect.stringContaining('Mau diubah apa'));
+    // JANGAN sendText — biar 1 thread, nggak nyetak prompt ganda.
+    expect(telegram.sendText).not.toHaveBeenCalled();
+    expect(service.hasPendingModify('user-1')).toBe(true);
+  });
+
+  it('continueModify does not re-ask — edits the same message with new recommendation', async () => {
+    prisma.scheduledTask.findMany.mockResolvedValue([]);
+    prisma.scheduledTask.deleteMany.mockResolvedValue({ count: 0 });
+    prisma.task.update.mockResolvedValue({});
+    prisma.task.findUnique.mockResolvedValue({ id: 't1', title: 'Makan' });
+    prisma.scheduledTask.create.mockImplementation(({ data }) => Promise.resolve({ id: 'sched-new', ...data }));
+    await service['onModuleInit']();
+
+    // Pending modify state — user udah klik Modify, chatId + messageId
+    // sudah ada dari rekomendasi awal.
+    service['pendingModify'].set('user-1', {
+      schedId: 'sched-1',
+      taskId: 't1',
+      chatId: 999,
+      messageId: 42,
+    });
+
+    prisma.scheduledTask.findUnique.mockResolvedValue({
+      id: 'sched-1',
+      userId: 'user-1',
+      status: 'PENDING',
+      startTime: new Date('2026-09-08T06:00:00.000Z'),
+      endTime: new Date('2026-09-08T07:00:00.000Z'),
+      taskId: 't1',
+      task: { title: 'Makan', description: '', priority: 'NORMAL', durationMinutes: 60, deadline: null },
+    });
+
+    // User ketik "pindah jam 15.50" → parser harus kasih preferredMinutes 950.
+    await service.continueModify(999, 'user-1', 'pindah jam 15.50');
+
+    // 1. Task di-update (data berganti).
+    expect(prisma.task.update).toHaveBeenCalledWith(
+      expect.objectContaining({ data: expect.objectContaining({ title: 'Makan' }) }),
+    );
+
+    // 2. Slot lama dihapus.
+    expect(prisma.scheduledTask.deleteMany).toHaveBeenCalledWith(
+      expect.objectContaining({ where: expect.objectContaining({ id: 'sched-1' }) }),
+    );
+
+    // 3. Pesan rekomendasi di-EDIT, bukan dikirim baru → 1 thread.
+    expect(telegram.editMessage).toHaveBeenCalledWith(
+      999, 42, expect.stringContaining('Schedule Recommendation'), expect.anything(),
+    );
+    // sendText nggak boleh dipanggil (dia nggak nanya "Mau diubah apa?" lagi,
+    // dia langsung edit pesan jadi rekomendasi baru).
+    expect(telegram.sendText).not.toHaveBeenCalled();
+
+    // 4. pendingModify sudah di-clear — user bisa lanjut task baru.
+    expect(service.hasPendingModify('user-1')).toBe(false);
+  });
+
+  it('modify "pindah jam 15.50" produces preferredMinutes=950', async () => {
+    // Verify parser path: "pindah jam 15.50" → 15*60+50 = 950
+    const ai = new AiService({ get: jest.fn(() => undefined) } as any);
+    const result = await ai.parseTask('pindah jam 15.50');
+    expect(result.preferredMinutes).toBe(15 * 60 + 50);
   });
 });

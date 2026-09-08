@@ -22,10 +22,21 @@ export class SchedulerService {
   // (bukan "invent 1 jam"): dipakai konsisten buat slot & pesan.
   private static readonly DEFAULT_DURATION_MINUTES = 60;
 
-  // State modify pending per user (in-memory; bot single-instance).
-  // Map<userId, { schedId, taskId }>. User yang lagi proses modify nggak
-  // boleh nimpa/numpuk — cukup satu alur aktif.
-  private pendingModify = new Map<string, { schedId: string; taskId: string }>();
+  // Thread rekomendasi terakhir per user (pesan + sched id) — dipakai buat
+  // Modify klik ngedit pesan yang SAMA, bukan bikin pesan baru.
+  private latestRecommendation = new Map<
+    string,
+    { schedId: string; taskId: string; chatId: number; messageId?: number }
+  >();
+
+  // User yang lagi AWAITING teks perubahan (habis klik Modify). Satu alur
+  // aktif per user. Dipakai juga sebagai gate: teks beikutnya = perubahan,
+  // bukan task baru. Hanya di-set oleh modifySchedule, di-clear oleh
+  // continueModify/cancel/reset — BUKAN setelah recomendation dikirim.
+  private pendingModify = new Map<
+    string,
+    { schedId: string; taskId: string; chatId: number; messageId?: number }
+  >();
 
   constructor(
     private readonly prisma: PrismaService,
@@ -76,7 +87,12 @@ export class SchedulerService {
       this.prisma.scheduledTask.findMany({
         where: {
           userId,
-          status: { not: 'CANCELLED' },
+          // Hanya slot KONFIRMASI (SCHEDULED) yang dianggap busy. Rekomendasi
+          // yang masih PENDING itu cuma saran — nggak nge-block slot. Sebelum
+          // ini PENDING ikut dihitung → rekomendasi-rekomendasi lama yang
+          // nggak pernah dikonfirmasi bikin slot jadi "bentrok" dan saran
+          // loncat ke 16:50/19:00 tanpa sebab.
+          status: 'SCHEDULED',
           endTime: { gt: now },
           startTime: { lt: searchEnd },
         },
@@ -177,6 +193,7 @@ export class SchedulerService {
     parsed: ParsedTask,
     slots: AvailableSlot[],
     existingTaskId?: string,
+    editMessageId?: number,
   ) {
     const tz = await this.getTimezone(userId);
     const now = new Date();
@@ -279,9 +296,40 @@ export class SchedulerService {
       ],
     };
 
-    await this.telegramService.sendRecommendation(chatId, text, replyMarkup);
+    // Kirim rekomendasi. editMessageId di-set (saat modify) → EDIT pesan lama,
+    // satu thread. Tanpa itu → pesan baru. Terus ingat thread-nya buat alur
+    // modify berikutnya.
+    return this.postRecommendation(
+      chatId,
+      userId,
+      sched.id,
+      task.id,
+      text,
+      replyMarkup,
+      editMessageId,
+    );
+  }
 
-    return sched;
+  // Kirim/edit rekomendasi, ingat thread-nya. editMessageId → edit pesan
+  // yang sudah ada; undefined → kirim pesan baru.
+  private async postRecommendation(
+    chatId: number,
+    userId: string,
+    schedId: string,
+    taskId: string,
+    text: string,
+    replyMarkup: any,
+    editMessageId?: number,
+  ) {
+    let messageId: number | undefined;
+    if (editMessageId) {
+      await this.telegramService.editMessage(chatId, editMessageId, text, replyMarkup);
+      messageId = editMessageId;
+    } else {
+      const res = await this.telegramService.sendRecommendation(chatId, text, replyMarkup);
+      messageId = res?.messageId;
+    }
+    this.latestRecommendation.set(userId, { schedId, taskId, chatId, messageId });
   }
 
   async confirmSchedule(chatId: number, userId: string, schedId: string) {
@@ -363,10 +411,27 @@ export class SchedulerService {
     return this.pendingModify.has(userId);
   }
 
+  // /start (atau perintah lain yang minta reset): bersihin semua state
+  // sesi — pending modify, thread rekomendasi lama, plus rekomendasi
+  // PENDING di DB yang nggak pernah dikonfirmasi. Bukan motong task /
+  // schedule yang udah KONFIRMASI (SCHEDULED).
+  async resetConversation(userId: string): Promise<void> {
+    this.pendingModify.delete(userId);
+    this.latestRecommendation.delete(userId);
+    await this.prisma.scheduledTask.deleteMany({
+      where: { userId, status: 'PENDING' },
+    });
+  }
+
   // Mulai alur modify: kunci state user, tanya apa yang mau diubah.
   // Slot lama TIDAK dihapus dulu — dihapus pas user kasih perubahan, biar
-  // kalau dia batal, jadwal asli tetap ada.
+  // kalau dia batal, jadwal asli tetap ada. Re-click Modify ketika sudah
+  // pending → ignore (nggak nimpa state / nggak nanya 2x).
   async modifySchedule(chatId: number, userId: string, schedId: string) {
+    if (this.pendingModify.has(userId)) {
+      return; // udah lagi proses modify buat task ini — nggak usah dobel
+    }
+
     const sched = await this.prisma.scheduledTask.findUnique({
       where: { id: schedId, userId },
       include: { task: true },
@@ -377,26 +442,44 @@ export class SchedulerService {
       return;
     }
 
-    this.pendingModify.set(userId, { schedId, taskId: sched.taskId });
+    // Ambil thread pesan rekomendasi dari latestRecommendation biar prompt
+    // ngedit pesan yg sama (kalau ada), bukan nyetak prompt baru. Cuma
+    // dipakai kalau rec itu untuk sched yang sama (biar nggak ngedit pesan
+    // rekomendasi lain kalau state kebawa).
+    const rec = this.latestRecommendation.get(userId);
+    const editMessageId =
+      rec && rec.schedId === schedId ? rec.messageId : undefined;
+
+    this.pendingModify.set(userId, {
+      schedId,
+      taskId: sched.taskId,
+      chatId,
+      messageId: editMessageId,
+    });
 
     const tz = await this.getTimezone(userId);
-    await this.telegramService.sendText(
-      chatId,
+    const promptText =
       `✏️ Mau diubah apa dari jadwal ini?\n\n` +
-        `📌 <b>${escapeHtml(sched.task.title)}</b>\n` +
-        `${format(toLocal(sched.startTime, tz), 'EEE, dd MMM', { locale: idLocale })} ` +
-        `${format(toLocal(sched.startTime, tz), 'HH:mm')} – ${format(toLocal(sched.endTime, tz), 'HH:mm')}\n\n` +
-        `Ketik perubahan, misalnya:\n` +
-        `• <code>pindah jam 3 sore</code>\n` +
-        `• <code>jadinya besok jam 10</code>\n` +
-        `• <code>durasi 2 jam</code>\n` +
-        `• <code>ganti judul belajar java</code>\n\n` +
-        `Atau ketik <code>batal</code> buat nggak jadi.`,
-    );
+      `📌 <b>${escapeHtml(sched.task.title)}</b>\n` +
+      `${format(toLocal(sched.startTime, tz), 'EEE, dd MMM', { locale: idLocale })} ` +
+      `${format(toLocal(sched.startTime, tz), 'HH:mm')} – ${format(toLocal(sched.endTime, tz), 'HH:mm')}\n\n` +
+      `Ketik perubahan, misalnya:\n` +
+      `• <code>pindah jam 15.50</code>\n` +
+      `• <code>jadinya besok jam 10</code>\n` +
+      `• <code>durasi 2 jam</code>\n` +
+      `• <code>ganti judul belajar java</code>\n\n` +
+      `Atau ketik <code>batal</code> buat nggak jadi.`;
+
+    if (editMessageId) {
+      await this.telegramService.editMessage(chatId, editMessageId, promptText);
+    } else {
+      await this.telegramService.sendText(chatId, promptText);
+    }
   }
 
   // Langkah 2: user udah ketik perubahan. Terapkan semua field baru dari
-  // parse, update task, hapus slot lama, lalu re-recommend.
+  // parse, update task, hapus slot lama, cari slot baru — TANPA bikin task
+  // duplikat & TANPA nanya "Mau diubah apa?" lagi.
   async continueModify(chatId: number, userId: string, text: string) {
     const pending = this.pendingModify.get(userId);
     if (!pending) {
@@ -426,6 +509,13 @@ export class SchedulerService {
     const tz = await this.getTimezone(userId);
     // Parse perubahan; field yang nggak disebut tetap dari task asli.
     const asked = await this.aiService.parseTask(text, tz);
+    if (asked.intent === 'UNKNOWN') {
+      await this.telegramService.sendText(
+        chatId,
+        'Hmm, gue nggak ngerti maksudnya. Ketik ulang perubahan, contoh: <code>pindah jam 15.50</code>',
+      );
+      return; // tetep pending, user bisa coba lagi
+    }
 
     // Judul cuma diganti kalau user EKSPLISIT minta ("ganti judul ...",
     // "ubah judul ..."). "pindah jam 3 sore" → parser kasih title "pindah"
@@ -486,7 +576,17 @@ export class SchedulerService {
       return;
     }
 
+    // Render rekomendasi baru (title dari parsed; tz sama seperti asli) dan
+    // EDIT pesan yang sama (satu thread) — nggak nyetak pesan baru.
     this.pendingModify.delete(userId);
-    await this.sendRecommendation(chatId, userId, parsed, slots, sched.taskId);
+    await this.sendRecommendation(
+      chatId,
+      userId,
+      parsed,
+      slots,
+      sched.taskId,
+      pending.messageId,
+    );
   }
-}
+
+  }
