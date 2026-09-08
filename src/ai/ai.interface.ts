@@ -16,6 +16,8 @@ export interface ParsedTask {
   preferredTime?: TimePreference;
   /** Jam mulai spesifik yang user minta (0-23), mis. "jam 1 siang" = 13. */
   preferredHour?: number;
+  /** Menit mulai spesifik (0-1439) — presisi penuh "11:50". null/undefined = user nggak minta jam. */
+  preferredMinutes?: number;
   date?: string;
   recurrence?: string;
 }

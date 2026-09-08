@@ -149,6 +149,12 @@ export class TelegramService implements OnModuleInit {
       // Send typing indicator
       await this.sendAction(message.chat.id, 'typing');
 
+      // Kalau user lagi proses modify (milih jadwal buat diubah), teks ini
+      // = perubahan yang diminta, bukan task baru.
+      if (this.schedulerService.hasPendingModify(user.id)) {
+        return this.schedulerService.continueModify(message.chat.id, user.id, text);
+      }
+
       // Parse task via AI, pake timezone user biar relatif (besok/hari ini)
       // nggak salah di zona server.
       const tz = await this.users.getTimezone(user.id);

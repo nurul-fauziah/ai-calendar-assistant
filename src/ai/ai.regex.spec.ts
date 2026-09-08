@@ -50,4 +50,61 @@ describe('AiService regex fallback', () => {
     expect(result.durationMinutes).toBe(15);
     expect(result.title).toContain('push notification');
   });
+
+  it('parses "Hari ini jam 11.50 siang bilangin ke dewi mau ikut ngelayat atau ngga"', async () => {
+    const result = await service.parseTask('Hari ini jam 11.50 siang bilangin ke dewi mau ikut ngelayat atau ngga');
+    expect(result.intent).toBe('CREATE_TASK');
+    expect(result.date).toBeDefined();
+    // time 11:50, bukan jadi 23:00
+    expect(result.preferredMinutes).toBe(11 * 60 + 50);
+    expect(result.preferredHour).toBe(11);
+    expect(result.durationMinutes).toBeUndefined();
+    // waktu/date ke-strip, judul bersih
+    expect(result.title).toContain('bilangin');
+    expect(result.title).not.toContain('11.50');
+    expect(result.title).not.toContain('Hari ini');
+    expect(result.title).not.toContain('jam');
+  });
+
+  it('supports colon minutes "jam 11:50 siang"', async () => {
+    const result = await service.parseTask('jam 11:50 siang rapat');
+    expect(result.preferredMinutes).toBe(11 * 60 + 50);
+  });
+
+  it('supports bare "11.50"', async () => {
+    const result = await service.parseTask('11.50 kerjain tugas');
+    expect(result.preferredMinutes).toBe(11 * 60 + 50);
+    expect(result.title).toContain('kerjain tugas');
+  });
+
+  it('supports "jam 8 pagi" = 08:00', async () => {
+    const result = await service.parseTask('jam 8 pagi olahraga');
+    expect(result.preferredMinutes).toBe(8 * 60);
+  });
+
+  it('supports "jam 8 malam" = 20:00 (bukan 08:00)', async () => {
+    const result = await service.parseTask('jam 8 malam nonton');
+    expect(result.preferredMinutes).toBe(20 * 60);
+  });
+
+  it('does not treat duration "2 jam" as a start time', async () => {
+    const result = await service.parseTask('belajar Python 2 jam');
+    expect(result.durationMinutes).toBe(120);
+    expect(result.preferredMinutes).toBeUndefined();
+  });
+
+  it('does not leak numeric decimal "11.50" as duration', async () => {
+    // Bare "11.50" bukan durasi 11.5 jam — harus jadi jam mulai.
+    const result = await service.parseTask('11.50 ketemu dewi');
+    expect(result.preferredMinutes).toBe(11 * 60 + 50);
+    expect(result.durationMinutes).toBeUndefined();
+  });
+
+  it('does not keep "jam" token in title for duration "1.5 jam"', async () => {
+    // "1.5 jam" = durasi 90m; title harus bersih, nggak nyisa "jam".
+    const result = await service.parseTask('1.5 jam meeting besok');
+    expect(result.durationMinutes).toBe(90);
+    expect(result.title).toBe('meeting');
+    expect(result.title).not.toContain('jam');
+  });
 });

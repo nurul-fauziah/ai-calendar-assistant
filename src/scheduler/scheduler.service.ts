@@ -5,6 +5,7 @@ import { PrismaService } from '../common/prisma.service';
 import { TelegramService } from '../telegram/telegram.service';
 import { TasksService } from '../tasks/tasks.service';
 import { ParsedTask, Priority } from '../ai/ai.interface';
+import { AiService } from '../ai/ai.service';
 import { escapeHtml } from '../common/html-escape';
 import { localDateToUtc, toLocal } from '../common/timezone';
 import { AvailableSlot, ScheduleItem } from './scheduler.interface';
@@ -17,10 +18,16 @@ export class SchedulerService {
   private readonly logger = new Logger(SchedulerService.name);
   private telegramService!: TelegramService;
 
+  // State modify pending per user (in-memory; bot single-instance).
+  // Map<userId, { schedId, taskId }>. User yang lagi proses modify nggak
+  // boleh nimpa/numpuk — cukup satu alur aktif.
+  private pendingModify = new Map<string, { schedId: string; taskId: string }>();
+
   constructor(
     private readonly prisma: PrismaService,
     private readonly calendar: CalendarService,
     private readonly tasksService: TasksService,
+    private readonly aiService: AiService,
     private readonly moduleRef: ModuleRef,
   ) {}
 
@@ -109,12 +116,12 @@ export class SchedulerService {
         .filter((e) => e.start < dayEndAbs && e.end > dayStartAbs)
         .sort((a, b) => a.start.getTime() - b.start.getTime());
 
-      // Work window: kalau user minta jam spesifik, mulai dari jam itu
-      // (dibatasi minimal 08:00 biar nggak aneh), otherwise 08:00.
-      const workStartHour = (parsed.preferredHour !== undefined && parsed.preferredHour >= 8 && parsed.preferredHour <= 22)
-        ? parsed.preferredHour
-        : 8;
-      const workStartAbs = addMinutes(dayStartAbs, workStartHour * 60);
+      // Work window: kalau user minta jam spesifik (preferredMinutes presisi),
+      // mulai dari jam itu, otherwise 08:00. Nggak di-clamp ke 8:00 —
+      // "11.50" harus mulai 11:50, bukan jam 8.
+      const workStartAbs = parsed.preferredMinutes !== undefined
+        ? addMinutes(dayStartAbs, parsed.preferredMinutes)
+        : addMinutes(dayStartAbs, 8 * 60);
       const workEndAbs = addMinutes(dayStartAbs, 22 * 60);
       // Jangan kasih slot sebelum sekarang di hari ini
       let c = workStartAbs > now ? workStartAbs : now;
@@ -327,6 +334,13 @@ export class SchedulerService {
     await this.telegramService.sendText(chatId, '❌ Jadwal dibatalkan.');
   }
 
+  hasPendingModify(userId: string): boolean {
+    return this.pendingModify.has(userId);
+  }
+
+  // Mulai alur modify: kunci state user, tanya apa yang mau diubah.
+  // Slot lama TIDAK dihapus dulu — dihapus pas user kasih perubahan, biar
+  // kalau dia batal, jadwal asli tetap ada.
   async modifySchedule(chatId: number, userId: string, schedId: string) {
     const sched = await this.prisma.scheduledTask.findUnique({
       where: { id: schedId, userId },
@@ -338,28 +352,108 @@ export class SchedulerService {
       return;
     }
 
-    // Hapus slot lama yang pending; task-nya KEEP (jangan duplikat).
-    await this.prisma.scheduledTask.deleteMany({
-      where: { id: schedId, userId },
-    });
+    this.pendingModify.set(userId, { schedId, taskId: sched.taskId });
 
     const tz = await this.getTimezone(userId);
-    const deadlineStr = sched.task.deadline
-      ? format(toLocal(sched.task.deadline, tz), 'yyyy-MM-dd')
-      : undefined;
+    await this.telegramService.sendText(
+      chatId,
+      `✏️ Mau diubah apa dari jadwal ini?\n\n` +
+        `📌 <b>${escapeHtml(sched.task.title)}</b>\n` +
+        `${format(toLocal(sched.startTime, tz), 'EEE, dd MMM', { locale: idLocale })} ` +
+        `${format(toLocal(sched.startTime, tz), 'HH:mm')} – ${format(toLocal(sched.endTime, tz), 'HH:mm')}\n\n` +
+        `Ketik perubahan, misalnya:\n` +
+        `• <code>pindah jam 3 sore</code>\n` +
+        `• <code>jadinya besok jam 10</code>\n` +
+        `• <code>durasi 2 jam</code>\n` +
+        `• <code>ganti judul belajar java</code>\n\n` +
+        `Atau ketik <code>batal</code> buat nggak jadi.`,
+    );
+  }
+
+  // Langkah 2: user udah ketik perubahan. Terapkan semua field baru dari
+  // parse, update task, hapus slot lama, lalu re-recommend.
+  async continueModify(chatId: number, userId: string, text: string) {
+    const pending = this.pendingModify.get(userId);
+    if (!pending) {
+      await this.telegramService.sendText(
+        chatId,
+        'Nggak ada jadwal yang lagi dimodify. Ketik aja task baru kalau mau jadwalin.',
+      );
+      return;
+    }
+
+    if (/^(batal|cancel|nggak jadi)\b/i.test(text.trim())) {
+      this.pendingModify.delete(userId);
+      await this.telegramService.sendText(chatId, 'Oke, modify dibatalkan.');
+      return;
+    }
+
+    const sched = await this.prisma.scheduledTask.findUnique({
+      where: { id: pending.schedId, userId },
+      include: { task: true },
+    });
+    if (!sched || sched.status === 'CANCELLED') {
+      this.pendingModify.delete(userId);
+      await this.telegramService.sendText(chatId, '❌ Jadwal tidak ditemukan.');
+      return;
+    }
+
+    const tz = await this.getTimezone(userId);
+    // Parse perubahan; field yang nggak disebut tetap dari task asli.
+    const asked = await this.aiService.parseTask(text, tz);
+
+    // Judul cuma diganti kalau user EKSPLISIT minta ("ganti judul ...",
+    // "ubah judul ..."). "pindah jam 3 sore" → parser kasih title "pindah"
+    // gara-gara waktu/strip — itu BUKAN perubahan judul.
+    let title = sched.task.title;
+    const wantsTitleChange = /(ganti|ubah|rename)\s+judul\s+(?:jadi\s+)?(.+)/i.test(text);
+    if (wantsTitleChange) {
+      const m = /(?:ganti|ubah|rename)\s+judul\s+(?:jadi\s+)?(.+)/i.exec(text);
+      title = m![1].trim();
+    }
+
+    let duration = sched.task.durationMinutes;
+    if (asked.durationMinutes) {
+      duration = asked.durationMinutes;
+    }
+
+    // Deadline: "besok"/"senin" → requested date. Disebut "hari ini" juga
+    // ke-set. Kalau nggak ada, keep asli.
+    let deadline = sched.task.deadline;
+    if (asked.deadline) {
+      deadline = new Date(asked.deadline);
+    }
+
     const parsed: ParsedTask = {
       intent: 'CREATE_TASK',
-      title: sched.task.title,
-      durationMinutes: sched.task.durationMinutes,
-      priority: sched.task.priority as Priority,
-      deadline: deadlineStr,
-      // Cari di hari deadline asli, bukan mulai hari ini (biar "besok"
-      // si user nggak dapat rekomendasi hari ini).
-      date: deadlineStr,
+      title,
+      durationMinutes: duration,
+      priority: (sched.task.priority || 'NORMAL') as Priority,
+      deadline: deadline ? format(toLocal(deadline, tz), 'yyyy-MM-dd') : undefined,
+      // Cari di tanggal target (kalau user sebut), else di hari deadline/
+      // hari ini — bukan mulai sekarang.
+      date: asked.date || (deadline ? format(toLocal(deadline, tz), 'yyyy-MM-dd') : undefined),
+      preferredMinutes: asked.preferredMinutes,
     };
+
+    // Update task-nya (judul/durasi/deadline yang berubah).
+    await this.prisma.task.update({
+      where: { id: sched.taskId },
+      data: {
+        title,
+        durationMinutes: duration,
+        ...(deadline ? { deadline } : {}),
+      },
+    });
+
+    // Hapus slot lama, cari pengganti.
+    await this.prisma.scheduledTask.deleteMany({
+      where: { id: sched.id, userId },
+    });
 
     const slots = await this.findAvailableSlots(userId, parsed);
     if (slots.length === 0) {
+      this.pendingModify.delete(userId);
       await this.telegramService.sendText(
         chatId,
         'Maaf, gue nggak nemu slot kosong yang cocok. 😞',
@@ -367,6 +461,7 @@ export class SchedulerService {
       return;
     }
 
+    this.pendingModify.delete(userId);
     await this.sendRecommendation(chatId, userId, parsed, slots, sched.taskId);
   }
 }

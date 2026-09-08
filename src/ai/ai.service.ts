@@ -37,6 +37,7 @@ export class AiService {
       '- priority: "LOW" | "NORMAL" | "HIGH" | "URGENT"',
       '- preferredTime: "MORNING" | "AFTERNOON" | "EVENING" | "NIGHT" | null',
       '- preferredHour: number | null (jam mulai SPESIFIK yang diminta, 0-23. "jam 1 siang" = 13, "jam 9 pagi" = 9, "13:00" = 13. null kalau nggak ada)',
+      '- preferredMinutes: number | null (menit mulai presisi, 0-1439. "11.50" = 710, "jam 8 pagi" = 480. null kalau nggak minta jam)',
       '- date: "YYYY-MM-DD" (tanggal mulai jika ada)',
       '- recurrence: string (misal "daily", "weekly", "monthly") | undefined',
       'Contoh:',
@@ -92,9 +93,12 @@ export class AiService {
       recurrence = 'monthly';
     }
 
-    // Parse duration: "2 jam", "1.5 jam", "30 menit", "1 jam 30 menit"
-    let durationMinutes = 60;
-    const durRegex = /(\d+(?:[\.,]\d+)?)\s*jam(?:\s*(\d+(?:[\.,]\d+)?)\s*menit)?/;
+    // Parse duration: "2 jam", "1.5 jam", "30 menit", "1 jam 30 menit".
+    // Nur "N jam" (angka sebelum kata jam) = duration. "jam N" = jam mulai,
+    // dibedakan di bawah. Kalau user nggak sebut durasi → undefined, biar
+    // scheduler default 60 — parser nggak ngarang.
+    let durationMinutes: number | undefined;
+    const durRegex = /(\d+(?:[\.,]\d+)?)\s*jam(?:\s+(\d+(?:[\.,]\d+)?)\s*menit)?/;
     const durMatch = durRegex.exec(text);
     if (durMatch) {
       const hours = parseFloat(durMatch[1].replace(',', '.'));
@@ -187,33 +191,64 @@ export class AiService {
       preferredTime = 'NIGHT';
     }
 
-    // Parse jam spesifik yang diminta, mis:
-    //   "jam 1" / "jam 1 siang" / "pukul 15" / "13:00" / "jam 1 sore" / "3pm"
-    // Periode (pagi/siang/sore/malam) menentukan offset +12 untuk jam 1-11.
-    let preferredHour: number | undefined;
-    const hourMatch = /(?:\b|pukul\s+|jam\s+)(\d{1,2})(?::(\d{2}))?\s*(pagi|siang|sore|malam)?(?:\b|$)/i.exec(text);
-    if (hourMatch && /(jam|pukul|:)/i.test(hourMatch[0])) {
-      let h = parseInt(hourMatch[1], 10);
-      const period = hourMatch[3];
-      if (period === 'siang' || period === 'sore' || period === 'malam') {
-        if (h < 12) h += 12;
-      } else {
-        // "jam 1" / "jam 3" tanpa periode = siang/sore, bukan subuh.
-        // Jam 1-7 umumnya selalu PM dalam ucapan sehari-hari.
-        if (h >= 1 && h <= 7) h += 12;
+    // Parse jam mulai SPESIFIK, presisi menit. Support format:
+    //   "jam 1", "jam 1 siang", "pukul 15", "13:00", "11.50", "jam 11.50",
+    //   "jam 8 pagi", "jam 8 malam", "18:30"
+    // Dipisah dari duration: "2 jam" (angka SEBELUM 'jam') = durasi;
+    // "jam 8"/"11:50" = jam mulai. Menit disimpan sebagai preferredMinutes.
+    let preferredMinutes: number | undefined;
+
+    const resolveTime = (hRaw: number, mRaw: number | undefined, period?: string): number | undefined => {
+      if (hRaw > 24 || (mRaw !== undefined && mRaw >= 60)) return undefined;
+      let h = hRaw;
+      if (mRaw !== undefined) {
+        // Menit eksplisit = jam sudah tertentu. "11.50 siang" = 11:50,
+        // "jam 11.50" = 11:50. Nggak usah geser +12.
+      } else if (period === 'siang' || period === 'sore' || period === 'malam') {
+        // Tanpa menit + periode: "jam 1 siang"=13, "jam 3 sore"=15,
+        // "jam 8 malam"=20.
+        if (h <= 11) h += 12;
+      } else if (h >= 1 && h <= 7) {
+        // "jam 1"/"jam 3" tanpa periode & tanpa menit = siang/sore (bukan subuh).
+        h += 12;
       }
-      if (h >= 0 && h <= 23) preferredHour = h;
+      return h * 60 + (mRaw || 0);
+    };
+
+    // Bentuk 1: diawali "jam"/"pukul" — SELALU jam mulai.
+    const prefixMatch = /\b(?:jam|pukul)\s+(\d{1,2})(?:\s*[:.]\s*(\d{1,2}))?\s*(pagi|siang|sore|malam)?/i.exec(text);
+    if (prefixMatch) {
+      preferredMinutes = resolveTime(
+        parseInt(prefixMatch[1], 10),
+        prefixMatch[2] !== undefined ? parseInt(prefixMatch[2], 10) : undefined,
+        prefixMatch[3],
+      );
+    } else {
+      // Bentuk 2: angka dengan pemisah ':' atau '.', "11.50"/"13:00".
+      // Bukan durasi: "1.5 jam" punya `.5` tapi diikuti " jam" → skip.
+      const bareMatch = /(?<![\d:.])(\d{1,2})\s*[:.]\s*(\d{1,2})(?!\s*(?:jam|pukul))/i.exec(text);
+      if (bareMatch) {
+        preferredMinutes = resolveTime(
+          parseInt(bareMatch[1], 10),
+          parseInt(bareMatch[2], 10),
+        );
+      }
     }
 
-    // Extract title: strip known keywords, keep remaining as title
+    // Extract title: strip known tokens (waktu, tanggal relatif, durasi,
+    // prioritas), sisanya jadi judul.
     let title = text
-      .replace(/\d+[\.,]?\d*\s*jam(?:\s*\d+[\.,]?\d*\s*menit)?/g, '')
-      .replace(/\d+\s*menit/g, '')
-      .replace(/(?:jam|pukul)\s+\d{1,2}(?::\d{2})?\s*(?:pagi|siang|sore|malam)?/gi, '')
-      .replace(/\d{1,2}:\d{2}/g, '')
-      .replace(/\b(besok|minggu depan|minggu ini|bulan depan|hari ini|sekarang|tomorrow|next week|next month|today)\b/g, '')
-      .replace(/\b(setiap hari|setiap minggu|setiap bulan|daily|weekly|monthly|tiap minggu|tiap bulan)\b/g, '')
-      .replace(/\b(urgent|penting|high|low|rendah|opsional|morning|afternoon|evening|night|pagi|siang|sore|malam|kritis|darurat)\b/g, '')
+      // Durasi DULUAN: "1.5 jam", "2 jam", "30 menit". Kalau strip waktu
+      // jalan duluan, "1.5" ke-eat jadi durasi "1.5 jam" → sisa "jam".
+      .replace(/\b\d+(?:[.,]\d+)?\s*jam(?:\s+\d+[\.,]?\d*\s*menit)?/gi, '')
+      .replace(/\b\d+\s*menit/gi, '')
+      // Waktu: "jam 8 pagi", "pukul 15.30", "11.50", "13:00", "18:30 siang"
+      .replace(/\b(?:jam|pukul)\s+\d{1,2}(?:\s*[:.]\s*\d{1,2})?\s*(?:pagi|siang|sore|malam)?/gi, '')
+      .replace(/\b\d{1,2}\s*[:.]\s*\d{1,2}\s*(?:pagi|siang|sore|malam)?/gi, '')
+      // Tanggal relatif + yang lain
+      .replace(/\b(besok|minggu depan|minggu ini|bulan depan|hari ini|sekarang|tomorrow|next week|next month|today|kemarin)\b/gi, '')
+      .replace(/\b(setiap hari|setiap minggu|setiap bulan|daily|weekly|monthly|tiap minggu|tiap bulan)\b/gi, '')
+      .replace(/\b(urgent|penting banget|kritis|darurat|penting|high|low|rendah|opsional|morning|afternoon|evening|night|pagi|siang|sore|malam)\b/gi, '')
       .replace(/\s+/g, ' ')
       .trim();
 
@@ -232,7 +267,10 @@ export class AiService {
       deadline,
       priority: priority as Priority,
       preferredTime,
-      preferredHour,
+      // preferredHour = preferredMinutes dibagi 60 (buat yang lama2 masih
+      // jalan); preferredMinutes = presisi penuh buat scheduler.
+      preferredHour: preferredMinutes !== undefined ? Math.floor(preferredMinutes / 60) : undefined,
+      preferredMinutes,
       date,
       recurrence,
     };

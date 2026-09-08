@@ -4,6 +4,8 @@ import { PrismaService } from '../common/prisma.service';
 import { CalendarService } from '../calendar/calendar.service';
 import { TelegramService } from '../telegram/telegram.service';
 import { TasksService } from '../tasks/tasks.service';
+import { AiService } from '../ai/ai.service';
+import { ConfigService } from '@nestjs/config';
 
 describe('SchedulerService', () => {
   let service: SchedulerService;
@@ -39,6 +41,7 @@ describe('SchedulerService', () => {
         { provide: CalendarService, useValue: calendar },
         { provide: TelegramService, useValue: telegram },
         { provide: TasksService, useValue: { createTask: jest.fn() } },
+        { provide: AiService, useValue: { parseTask: jest.fn() } },
       ],
     }).compile();
 
@@ -91,19 +94,21 @@ describe('SchedulerService', () => {
     expect(overlapsBusy).toBe(false);
   });
 
-  it('prefers the requested hour as the slot start', async () => {
+  it('starts slot at the requested precise time (preferredMinutes)', async () => {
     prisma.scheduledTask.findMany.mockResolvedValue([]);
-    // preferredHour 13 => slot pertama harus mulai >= 13:00 WIB (06:00Z)
+    // preferredMinutes 710 = 11:50 WIB (04:50Z)
     const slots = await service.findAvailableSlots('user-1', {
       intent: 'CREATE_TASK',
       title: 'Rapat',
       durationMinutes: 30,
-      preferredHour: 13,
+      preferredMinutes: 11 * 60 + 50,
     });
 
     expect(slots.length).toBeGreaterThan(0);
     const first = slots[0];
-    expect(first.start.getUTCHours()).toBeGreaterThanOrEqual(6); // 06:00Z = 13:00 WIB
+    const local = first.start.getUTCHours() * 60 + first.start.getUTCMinutes();
+    // 11:50 WIB = 04:50Z
+    expect(local).toBe(4 * 60 + 50);
   });
 
   it('rejects confirm when another task overlaps that slot', async () => {
