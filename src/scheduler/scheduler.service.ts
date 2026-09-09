@@ -9,7 +9,7 @@ import { AiService } from '../ai/ai.service';
 import { escapeHtml } from '../common/html-escape';
 import { localDateToUtc, toLocal } from '../common/timezone';
 import { AvailableSlot, ScheduleItem } from './scheduler.interface';
-import { addDays, addMinutes } from 'date-fns';
+import { addDays, addMinutes, addMonths } from 'date-fns';
 import { format } from 'date-fns-tz';
 import { id as idLocale } from 'date-fns/locale/id';
 
@@ -36,6 +36,14 @@ export class SchedulerService {
   private pendingModify = new Map<
     string,
     { schedId: string; taskId: string; chatId: number; messageId?: number }
+  >();
+
+  // Negara bagian untuk klarifikasi recurrence: user udah bilang "setiap
+  // senin" tapi belum kasih jam mulai. Di-set saat recommendation 'needsTime',
+  // di-clear saat jawaban diterima / batal / reset.
+  private pendingRecurTime = new Map<
+    string,
+    { chatId: number; taskId: string; rrule: string }
   >();
 
   constructor(
@@ -198,6 +206,21 @@ export class SchedulerService {
     const tz = await this.getTimezone(userId);
     const now = new Date();
     const duration = parsed.durationMinutes ?? SchedulerService.DEFAULT_DURATION_MINUTES;
+
+    // Recurring task: user udah bilang polanya tapi belum sebut jam → minta
+    // jam mulai dulu (klarifikasi), bukan langsung ngarang slot.
+    if (parsed.recurrenceRule && !/BYHOUR=/.test(parsed.recurrenceRule)) {
+      this.pendingRecurTime.set(userId, {
+        chatId,
+        taskId: existingTaskId ?? '',
+        rrule: parsed.recurrenceRule,
+      });
+      await this.telegramService.sendText(
+        chatId,
+        '🔁 Udahan untuk jadwal ulang, tapi jamnya belum disebut. Ketik jam mulainya, misal <code>jam 7 pagi</code> atau <code>15.30</code>.',
+      );
+      return;
+    }
     const selectedSlots = slots.slice(0, 3).filter((s) => s.availableMinutes >= duration);
 
     if (selectedSlots.length === 0) {
@@ -261,6 +284,9 @@ export class SchedulerService {
     if (startNotice) text += startNotice + '\n';
     text += `📌 <b>${escapeHtml(parsed.title || 'Untitled')}</b>\n`;
     text += `Duration: ${Math.round(duration / 60)}h${duration % 60}\n`;
+    if (parsed.recurrenceRule) {
+      text += `🔁 ${this.describeRecurrence(parsed.recurrenceRule)}\n`;
+    }
     if (parsed.deadline) {
       text += `Deadline: ${format(localDateToUtc(parsed.deadline, tz), 'EEE, dd MMM', { locale: idLocale })}\n`;
     }
@@ -276,15 +302,32 @@ export class SchedulerService {
     const totalMins = duration % 60;
     text += `Total: ${totalHours}h${totalMins > 0 ? totalMins + 'm' : ''}\n`;
 
-    const sched = await this.prisma.scheduledTask.create({
-      data: {
-        taskId: task.id,
-        userId,
-        startTime: items[0].start,
-        endTime: items[items.length - 1].end,
-        status: 'PENDING',
-      },
-    });
+    // Unique (userId, taskId, status) → kalau rekomendasi yang sama diproses
+    // 2x (race / retry webhook), create kedua kena P2002. Reuse sched lama
+    // daripada crash / bikin duplikat.
+    let sched;
+    try {
+      sched = await this.prisma.scheduledTask.create({
+        data: {
+          taskId: task.id,
+          userId,
+          startTime: items[0].start,
+          endTime: items[items.length - 1].end,
+          status: 'PENDING',
+          recurrence: parsed.recurrenceRule,
+        },
+      });
+    } catch (err) {
+      const code = (err as any)?.code;
+      if (code === 'P2002') {
+        sched = await this.prisma.scheduledTask.findFirst({
+          where: { userId, taskId: task.id, status: 'PENDING' },
+        });
+        if (!sched) throw err;
+      } else {
+        throw err;
+      }
+    }
 
     const replyMarkup = {
       inline_keyboard: [
@@ -378,6 +421,7 @@ export class SchedulerService {
         description: task.description || '',
         start: sched.startTime,
         end: sched.endTime,
+        rrule: sched.recurrence ?? undefined,
       });
       calendarMsg = '📆 Berhasil ditambahkan ke Google Calendar!';
     } catch (err) {
@@ -411,12 +455,17 @@ export class SchedulerService {
     return this.pendingModify.has(userId);
   }
 
+  hasPendingRecurTime(userId: string): boolean {
+    return this.pendingRecurTime.has(userId);
+  }
+
   // /start (atau perintah lain yang minta reset): bersihin semua state
   // sesi — pending modify, thread rekomendasi lama, plus rekomendasi
   // PENDING di DB yang nggak pernah dikonfirmasi. Bukan motong task /
   // schedule yang udah KONFIRMASI (SCHEDULED).
   async resetConversation(userId: string): Promise<void> {
     this.pendingModify.delete(userId);
+    this.pendingRecurTime.delete(userId);
     this.latestRecommendation.delete(userId);
     await this.prisma.scheduledTask.deleteMany({
       where: { userId, status: 'PENDING' },
@@ -589,4 +638,151 @@ export class SchedulerService {
     );
   }
 
+  // User lagi ngerjain recurrence tanpa jam (klarifikasi). Jawaban berikutnya
+  // = jam mulai. Terapkan ke task, hitung occurrence pertama, rekomendasiin.
+  async continueRecurTime(chatId: number, userId: string, text: string) {
+    const pending = this.pendingRecurTime.get(userId);
+    if (!pending) return;
+
+    if (/^(batal|cancel|nggak jadi)\b/i.test(text.trim())) {
+      this.pendingRecurTime.delete(userId);
+      await this.telegramService.sendText(chatId, 'Oke, jadwal ulang dibatalkan.');
+      return;
+    }
+
+    const tz = await this.getTimezone(userId);
+    const asked = await this.aiService.parseTask(text, tz);
+    if (asked.preferredMinutes === undefined) {
+      await this.telegramService.sendText(
+        chatId,
+        'Jam mulainya yang mana? Contoh: <code>jam 7 pagi</code> atau <code>15.30</code>.',
+      );
+      return; // tetep pending
+    }
+
+    const rule = pending.rrule.replace(
+      /(;BYHOUR=\d+;BYMINUTE=\d+)?$/,
+      `;BYHOUR=${Math.floor(asked.preferredMinutes / 60)};BYMINUTE=${asked.preferredMinutes % 60}`,
+    );
+    let task = pending.taskId
+      ? await this.prisma.task.findUnique({ where: { id: pending.taskId } })
+      : null;
+
+    const parsed: ParsedTask = {
+      intent: 'CREATE_TASK',
+      title: task?.title || 'Untitled',
+      durationMinutes: task?.durationMinutes ?? SchedulerService.DEFAULT_DURATION_MINUTES,
+      preferredMinutes: asked.preferredMinutes,
+      recurrenceRule: rule,
+    };
+    const parsedFull = { ...parsed, title: task?.title || 'Untitled' };
+
+    // Kalau task belum ada (baru ambiguous recurring diawal), bikin sekarang.
+    if (!task) {
+      task = await this.tasksService.createTask(userId, parsedFull);
+      this.pendingRecurTime.set(userId, { ...pending, taskId: task.id });
+    } else {
+      await this.prisma.task.update({
+        where: { id: task.id },
+        data: { recurrence: rule },
+      });
+    }
+
+    this.pendingRecurTime.delete(userId);
+
+    const start = this.firstOccurrenceForRule(rule, tz);
+    const end = addMinutes(start, parsed.durationMinutes || SchedulerService.DEFAULT_DURATION_MINUTES);
+    const slot: AvailableSlot = { start, end, availableMinutes: parsed.durationMinutes || SchedulerService.DEFAULT_DURATION_MINUTES };
+
+    // Cek konflik occurrence pertama sama Google Calendar.
+    const conflict = await this.calendar.checkRecurConflict(userId, start, end, tz);
+    if (conflict) {
+      await this.telegramService.sendText(
+        chatId,
+        `⚠️ Jam itu bentrok sama jadwal lain. Coba jam lain? Ketik jam barunya.`,
+      );
+      this.pendingRecurTime.set(userId, { ...pending, taskId: task.id, rrule: rule });
+      return;
+    }
+
+    await this.sendRecommendation(chatId, userId, parsedFull, [slot], task.id);
   }
+
+  // Human-readable label dari RRULE buat pesan rekomendasi.
+  private describeRecurrence(rule: string): string {
+    const byDay = /BYDAY=([A-Z]+)/.exec(rule)?.[1];
+    const byMonthDay = /BYMONTHDAY=(\d+)/.exec(rule)?.[1];
+    const hour = /BYHOUR=(\d+)/.exec(rule)?.[1];
+    const minute = /BYMINUTE=(\d+)/.exec(rule)?.[1];
+    const time = hour !== undefined
+      ? `${String(+hour).padStart(2, '0')}:${String(+(minute || 0)).padStart(2, '0')}`
+      : '';
+
+    let freq: string;
+    if (rule.startsWith('FREQ=DAILY')) freq = 'Every day';
+    else if (rule.startsWith('FREQ=WEEKLY')) freq = 'Every week';
+    else if (rule.startsWith('FREQ=MONTHLY')) freq = 'Every month';
+    else freq = rule;
+
+    if (byDay) {
+      const names: Record<string, string> = {
+        MO: 'Monday', TU: 'Tuesday', WE: 'Wednesday', TH: 'Thursday',
+        FR: 'Friday', SA: 'Saturday', SU: 'Sunday',
+      };
+      freq += ` on ${names[byDay] || byDay}`;
+    }
+    if (byMonthDay) freq += ` on day ${byMonthDay}`;
+    if (time) freq += ` at ${time}`;
+    return freq;
+  }
+
+  // Occurrence pertama dari RRULE, dihitung dari hari ini (zona user).
+  private firstOccurrenceForRule(rule: string, tz = 'Asia/Jakarta'): Date {
+    const today = new Date();
+    const weekday = /BYDAY=(MO|TU|WE|TH|FR|SA|SU)/.exec(rule)?.[1];
+    const monthDay = /BYMONTHDAY=(\d+)/.exec(rule)?.[1];
+    const hourRaw = /BYHOUR=(\d+)/.exec(rule)?.[1];
+    const minuteRaw = /BYMINUTE=(\d+)/.exec(rule)?.[1];
+    const hour = hourRaw !== undefined ? +hourRaw : undefined;
+    const minute = minuteRaw !== undefined ? +minuteRaw : 0;
+
+    // Mulai-hari (midnight zona user) tanggal itu + jam mulai kalau ada.
+    // localDateToUtc SUDAH nambah "T00:00:00" — jangan dobel.
+    const at = (d: Date) => {
+      const local = format(d, 'yyyy-MM-dd', { timeZone: tz });
+      const abs = localDateToUtc(local, tz);
+      return hour !== undefined ? addMinutes(abs, hour * 60 + minute) : abs;
+    };
+
+    let first: Date;
+    if (rule.startsWith('FREQ=DAILY')) {
+      first = at(today);
+    } else if (weekday) {
+      const iso: Record<string, number> = { MO: 1, TU: 2, WE: 3, TH: 4, FR: 5, SA: 6, SU: 0 };
+      const target = iso[weekday];
+      const todayIso = toLocal(today, tz).getDay();
+      let diff = (target - todayIso + 7) % 7;
+      if (diff === 0) diff = 7; // hari ini udah lewat → minggu depan
+      first = at(addDays(today, diff));
+    } else if (monthDay) {
+      // Hari (local) di bulan ini, clip 29-31 Feb/Apr dst. String tanggal biar
+      // format lokal user konsisten, bukan mutasi host-local.
+      const monthDayOf = (d: Date) => {
+        const y = +format(d, 'yyyy', { timeZone: tz });
+        const m = +format(d, 'MM', { timeZone: tz });
+        const last = new Date(Date.UTC(y, m, 0)).getUTCDate();
+        return `${y}-${String(m).padStart(2, '0')}-${String(Math.min(monthDay, last)).padStart(2, '0')}`;
+      };
+      let cand = monthDayOf(today);
+      if (cand < format(today, 'yyyy-MM-dd', { timeZone: tz })) {
+        cand = monthDayOf(addMonths(today, 1));
+      }
+      first = localDateToUtc(cand, tz);
+      if (hour !== undefined) first = addMinutes(first, hour * 60 + minute);
+    } else {
+      first = at(today);
+    }
+    return first;
+  }
+
+}

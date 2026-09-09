@@ -19,7 +19,7 @@ describe('TelegramService', () => {
         TelegramService,
         { provide: UsersService, useValue: { findByTelegramId: jest.fn(), create: jest.fn(), getTimezone: jest.fn().mockResolvedValue('Asia/Jakarta') } },
         { provide: AiService, useValue: { parseTask: jest.fn() } },
-        { provide: SchedulerService, useValue: { findAvailableSlots: jest.fn(), sendRecommendation: jest.fn(), confirmSchedule: jest.fn(), cancelSchedule: jest.fn(), modifySchedule: jest.fn(), hasPendingModify: jest.fn(), resetConversation: jest.fn(), continueModify: jest.fn() } },
+        { provide: SchedulerService, useValue: { findAvailableSlots: jest.fn(), sendRecommendation: jest.fn(), confirmSchedule: jest.fn(), cancelSchedule: jest.fn(), modifySchedule: jest.fn(), hasPendingModify: jest.fn(), hasPendingRecurTime: jest.fn(), resetConversation: jest.fn(), continueModify: jest.fn(), continueRecurTime: jest.fn() } },
         { provide: CalendarService, useValue: { getEvents: jest.fn(), buildTodaySummary: jest.fn(), buildWeekSummary: jest.fn() } },
       ],
     }).compile();

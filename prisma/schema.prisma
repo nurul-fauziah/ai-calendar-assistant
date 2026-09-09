@@ -44,6 +44,9 @@ model Task {
   deadline        DateTime?
   priority        TaskPriority    @default(NORMAL)
   status          TaskStatus      @default(PENDING)
+  // RFC-5545 RRULE, misal "FREQ=WEEKLY;BYDAY=MO" / "FREQ=MONTHLY;BYMONTHDAY=1".
+  // null = task sekali jalan (one-off).
+  recurrence      String?         @map("recurrence")
   createdAt       DateTime        @default(now()) @map("created_at")
   updatedAt       DateTime        @updatedAt @map("updated_at")
   scheduledTasks  ScheduledTask[]
@@ -60,10 +63,16 @@ model ScheduledTask {
   endTime         DateTime   @map("end_time")
   calendarEventId String?    @map("calendar_event_id")
   status          TaskStatus @default(SCHEDULED)
+  // RRULE yang dipakai buat event ini (kalau task recurring). null = one-off.
+  recurrence      String?    @map("recurrence")
   createdAt       DateTime   @default(now()) @map("created_at")
   user            User       @relation(fields: [userId], references: [id], onDelete: Cascade)
   task            Task       @relation(fields: [taskId], references: [id], onDelete: Cascade)
 
+  // Unik per (user, task, status): mencegah duplikat rekomendasi PENDING kalau
+  // permintaan yang sama diproses 2x. Status ikut serta biar sched yang udah
+  // di-confirm (status beda) bisa ada buat task yang sama.
+  @@unique([userId, taskId, status])
   @@map("scheduled_tasks")
 }
 

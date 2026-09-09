@@ -83,14 +83,78 @@ export class AiService {
   private parseWithRegex(text: string, timezone?: string): ParsedTask {
     const lower = text.toLowerCase().trim();
 
-    // Detect recurrence
+    // ─── Recurrence ──────────────────────────────────────────────────────
+    // `recurrenceRule` = RFC-5545 RRULE buat Google Calendar & scheduler.
+    // `recurrence` = label legacy "daily"/"weekly"/"monthly" (back-compat).
+    // Recurring task TIDAK punya `date`/`deadline` — scheduler cari occurrence
+    // pertama sendiri lewat recurrenceWeekday/recurrenceMonthDay.
+    const weekdays: Record<string, number> = {
+      senin: 1, selasa: 2, rabu: 3, kamis: 4,
+      jumat: 5, sabtu: 6, minggu: 7, ahad: 7,
+    };
+    const byDayCode: Record<number, string> = { 1: 'MO', 2: 'TU', 3: 'WE', 4: 'TH', 5: 'FR', 6: 'SA', 7: 'SU' };
+
     let recurrence: string | undefined;
-    if (lower.includes('setiap hari') || lower.includes('daily')) {
-      recurrence = 'daily';
-    } else if (lower.includes('setiap minggu') || lower.includes('weekly') || lower.includes('tiap minggu')) {
+    let recurrenceRule: string | undefined;
+    let recurrenceWeekdayP: number | undefined;
+    let recurrenceMonthDayP: number | undefined;
+
+    const isDaily = /(setiap\s+hari|tiap\s+hari|\bharian\b)/i.test(lower);
+    const isWeekly = /(setiap\s+minggu|tiap\s+minggu|mingguan|weekly)/i.test(lower);
+    const isMonthly = /(setiap\s+bulan|tiap\s+bulan|bulanan|monthly)/i.test(lower);
+
+    // 0. "setiap hari Jumat" = tiap MINGGU hari Jumat (weekly + weekday),
+    //    bukan "tiap hari". Dicek DULU biar nggak kena isDaily.
+    const weekdayHari = /setiap\s+hari\s+(senin|selasa|rabu|kamis|jumat|sabtu|minggu|ahad)/i.exec(lower);
+    if (weekdayHari) {
       recurrence = 'weekly';
-    } else if (lower.includes('setiap bulan') || lower.includes('monthly') || lower.includes('tiap bulan')) {
+      recurrenceWeekdayP = weekdays[weekdayHari[1].toLowerCase()];
+      recurrenceRule = `FREQ=WEEKLY;BYDAY=${byDayCode[recurrenceWeekdayP]}`;
+    }
+
+    // 1. "setiap hari" → daily
+    if (isDaily && !recurrence) {
+      recurrence = 'daily';
+      recurrenceRule = 'FREQ=DAILY';
+    }
+
+    // 2. "setiap minggu hari Jumat" → weekly + weekday
+    if (isWeekly && !recurrence) {
+      recurrence = 'weekly';
+      const w = /hari\s+(senin|selasa|rabu|kamis|jumat|sabtu|minggu|ahad)/i.exec(lower);
+      if (w) {
+        recurrenceWeekdayP = weekdays[w[1].toLowerCase()];
+        recurrenceRule = `FREQ=WEEKLY;BYDAY=${byDayCode[recurrenceWeekdayP]}`;
+      } else {
+        recurrenceRule = 'FREQ=WEEKLY'; // no weekday → clarify later
+      }
+    }
+
+    // 3. "setiap tanggal 1" → monthly + BYMONTHDAY. "bulanan"/"monthly" saja
+    //    → monthly tanpa BYMONTHDAY (tanggal nempel di occurrence pertama).
+    const monthDayMatch = /setiap\s+tanggal\s+(\d{1,2})/i.exec(lower);
+    if (monthDayMatch && !recurrence) {
+      const md = parseInt(monthDayMatch[1], 10);
+      if (md >= 1 && md <= 31) {
+        recurrence = 'monthly';
+        recurrenceMonthDayP = md;
+        recurrenceRule = `FREQ=MONTHLY;BYMONTHDAY=${md}`;
+      }
+    } else if (isMonthly && !recurrence) {
       recurrence = 'monthly';
+      recurrenceRule = 'FREQ=MONTHLY';
+    }
+
+    // 4. "setiap senin" (tanpa "minggu") → weekly + weekday
+    if (!recurrence) {
+      for (const [name, num] of Object.entries(weekdays)) {
+        if (new RegExp(`\\b(setiap|tiap)\\s+${name}\\b`).test(lower)) {
+          recurrence = 'weekly';
+          recurrenceWeekdayP = num;
+          recurrenceRule = `FREQ=WEEKLY;BYDAY=${byDayCode[num]}`;
+          break;
+        }
+      }
     }
 
     // Parse duration: "2 jam", "1.5 jam", "30 menit", "1 jam 30 menit".
@@ -156,53 +220,61 @@ export class AiService {
 
     let target: string | undefined;
 
-    // 1) "tanggal 10 september" / "10 september" — nama bulan
-    const monthNameMatch = /\b(?:tanggal\s+)?(\d{1,2})\s+([a-z]+)\b/i.exec(lower);
-    if (monthNameMatch && monthMap[monthNameMatch[2].toLowerCase()]) {
-      target = buildDateStr(+monthNameMatch[1], monthMap[monthNameMatch[2].toLowerCase()]);
-    }
+    // Recurring task: TIDAK pakai `date`/`deadline` dari relative/calendar date.
+    // Scheduler yang hitung occurrence pertama lewat recurrenceWeekday/monthDay.
+    // Kalau user set BOTH recurring + explicit start date ("mulai 10 sept"), itu
+    // kasus lanjutan — skip dulu.
+    const isRecurring = recurrence !== undefined;
 
-    // 2) "10/09" / "10-09" — numerik (dd/mm gaya Indonesia)
-    if (!target) {
-      const numDate = /\b(\d{1,2})[\/-](\d{1,2})\b/i.exec(lower);
-      if (numDate) {
-        target = buildDateStr(+numDate[1], +numDate[2]);
-      }
-    }
-
-    // Relative dates — HANYA kalau nggak ada tanggal eksplisit.
-    if (!target) {
-      if (lower.includes('hari ini') || lower.includes('sekarang') || lower.includes('today')) {
-        target = todayStr;
-      } else if (lower.includes('lusa')) {
-        target = shiftLocal(2 * dayMs);
-      } else if (lower.includes('besok') || lower.includes('tomorrow')) {
-        target = shiftLocal(dayMs);
-      } else if (lower.includes('minggu depan') || lower.includes('next week')) {
-        target = shiftLocal(7 * dayMs);
-      } else if (lower.includes('minggu ini')) {
-        target = shiftLocal(-todayWeekday * dayMs);
-      } else if (lower.includes('bulan depan') || lower.includes('next month')) {
-        target = shiftLocal(30 * dayMs);
+    if (!isRecurring) {
+      // 1) "tanggal 10 september" / "10 september" — nama bulan
+      const monthNameMatch = /\b(?:tanggal\s+)?(\d{1,2})\s+([a-z]+)\b/i.exec(lower);
+      if (monthNameMatch && monthMap[monthNameMatch[2].toLowerCase()]) {
+        target = buildDateStr(+monthNameMatch[1], monthMap[monthNameMatch[2].toLowerCase()]);
       }
 
-      // Day of week names
+      // 2) "10/09" / "10-09" — numerik (dd/mm gaya Indonesia)
       if (!target) {
-        for (const [dayName, dayNum] of Object.entries(dayMap)) {
-          const regex = new RegExp(`\\b${dayName}\\b`);
-          if (regex.test(lower)) {
-            const diff = (dayNum - todayWeekday + 7) % 7;
-            target = todayStr;
-            if (diff !== 0) target = shiftLocal(diff * dayMs);
-            break;
+        const numDate = /\b(\d{1,2})[\/-](\d{1,2})\b/i.exec(lower);
+        if (numDate) {
+          target = buildDateStr(+numDate[1], +numDate[2]);
+        }
+      }
+
+      // Relative dates — HANYA kalau nggak ada tanggal eksplisit.
+      if (!target) {
+        if (lower.includes('hari ini') || lower.includes('sekarang') || lower.includes('today')) {
+          target = todayStr;
+        } else if (lower.includes('lusa')) {
+          target = shiftLocal(2 * dayMs);
+        } else if (lower.includes('besok') || lower.includes('tomorrow')) {
+          target = shiftLocal(dayMs);
+        } else if (lower.includes('minggu depan') || lower.includes('next week')) {
+          target = shiftLocal(7 * dayMs);
+        } else if (lower.includes('minggu ini')) {
+          target = shiftLocal(-todayWeekday * dayMs);
+        } else if (lower.includes('bulan depan') || lower.includes('next month')) {
+          target = shiftLocal(30 * dayMs);
+        }
+
+        // Day of week names
+        if (!target) {
+          for (const [dayName, dayNum] of Object.entries(dayMap)) {
+            const regex = new RegExp(`\\b${dayName}\\b`);
+            if (regex.test(lower)) {
+              const diff = (dayNum - todayWeekday + 7) % 7;
+              target = todayStr;
+              if (diff !== 0) target = shiftLocal(diff * dayMs);
+              break;
+            }
           }
         }
       }
-    }
 
-    if (target) {
-      date = target;
-      deadline = target;
+      if (target) {
+        date = target;
+        deadline = target;
+      }
     }
 
     // Priority keywords
@@ -234,7 +306,7 @@ export class AiService {
     // "jam 8"/"11:50" = jam mulai. Menit disimpan sebagai preferredMinutes.
     let preferredMinutes: number | undefined;
 
-    const resolveTime = (hRaw: number, mRaw: number | undefined, period?: string): number | undefined => {
+    const resolveTime = (hRaw: number, mRaw: number | undefined, period?: string, strict?: boolean): number | undefined => {
       if (hRaw > 24 || (mRaw !== undefined && mRaw >= 60)) return undefined;
       let h = hRaw;
       if (mRaw !== undefined) {
@@ -244,20 +316,23 @@ export class AiService {
         // Tanpa menit + periode: "jam 1 siang"=13, "jam 3 sore"=15,
         // "jam 8 malam"=20.
         if (h <= 11) h += 12;
-      } else if (h >= 1 && h <= 7) {
+      } else if (!strict && h >= 1 && h <= 7) {
         // "jam 1"/"jam 3" tanpa periode & tanpa menit = siang/sore (bukan subuh).
+        // Kecuali recurring (strict): "setiap senin jam 7" = 07:00 pagi.
         h += 12;
       }
       return h * 60 + (mRaw || 0);
     };
 
     // Bentuk 1: diawali "jam"/"pukul" — SELALU jam mulai.
+    // Recurring: tanpa periode → tetap pagi ("setiap senin jam 7" = 07:00).
     const prefixMatch = /\b(?:jam|pukul)\s+(\d{1,2})(?:\s*[:.]\s*(\d{1,2}))?\s*(pagi|siang|sore|malam)?/i.exec(text);
     if (prefixMatch) {
       preferredMinutes = resolveTime(
         parseInt(prefixMatch[1], 10),
         prefixMatch[2] !== undefined ? parseInt(prefixMatch[2], 10) : undefined,
         prefixMatch[3],
+        recurrence !== undefined,
       );
     } else {
       // Bentuk 2: angka dengan pemisah ':' atau '.', "11.50"/"13:00".
@@ -271,6 +346,12 @@ export class AiService {
       }
     }
 
+    // Waktu mulainya recurrence (kalau user kasih) → taruh di RRULE.
+    // "setiap senin jam 7" → FREQ=WEEKLY;BYDAY=MO;BYHOUR=7;BYMINUTE=0.
+    if (recurrenceRule && preferredMinutes !== undefined) {
+      recurrenceRule += `;BYHOUR=${Math.floor(preferredMinutes / 60)};BYMINUTE=${preferredMinutes % 60}`;
+    }
+
     // Extract title: strip known tokens (waktu, tanggal relatif, durasi,
     // prioritas), sisanya jadi judul.
     let title = text
@@ -278,6 +359,17 @@ export class AiService {
       // jalan duluan, "1.5" ke-eat jadi durasi "1.5 jam" → sisa "jam".
       .replace(/\b\d+(?:[.,]\d+)?\s*jam(?:\s+\d+[\.,]?\d*\s*menit)?/gi, '')
       .replace(/\b\d+\s*menit/gi, '')
+      // Recurring DULU (sebelum tanggal generik): "setiap tanggal 1 bayar"
+      // beda dari "tanggal 1" one-off — harus ke-eat penuh "setiap tanggal 1".
+      .replace(/\bsetiap\s+tanggal\s+\d{1,2}\b/gi, '')
+      .replace(/\b(setiap|tiap)\s+(senin|selasa|rabu|kamis|jumat|sabtu|minggu|ahad)\b/gi, '')
+      // "setiap hari Jumat" → weekly: jangan biarin "setiap hari" ke-strip
+      // dulu & nyisa "Jumat". Selalu makan "setiap hari <hari>" penuh.
+      // ("hari ini" di-handle di blok relatif DI BAWAH; di sini regex nggak
+      // pakai \b hari\w+ biar "hari ini" aman dipisah dulu)
+      .replace(/\bsetiap\s+hari\s+(senin|selasa|rabu|kamis|jumat|sabtu|minggu|ahad)\b/gi, '')
+      .replace(/\bhari\s+(senin|selasa|rabu|kamis|jumat|sabtu|minggu|ahad)\b/gi, '')
+      .replace(/\b(setiap hari|setiap minggu|setiap bulan|daily|weekly|monthly|tiap minggu|tiap bulan|tiap hari|mingguan|bulanan|harian)\b/gi, '')
       // Waktu: "jam 8 pagi", "pukul 15.30", "11.50", "13:00", "18:30 siang"
       .replace(/\b(?:jam|pukul)\s+\d{1,2}(?:\s*[:.]\s*\d{1,2})?\s*(?:pagi|siang|sore|malam)?/gi, '')
       .replace(/\b\d{1,2}\s*[:.]\s*\d{1,2}\s*(?:pagi|siang|sore|malam)?/gi, '')
@@ -286,9 +378,8 @@ export class AiService {
       .replace(/\btanggal\s+\d{1,2}\s+[a-z]+\b/gi, '')
       .replace(/\b\d{1,2}\s+[a-z]+\b/gi, '')
       .replace(/\b\d{1,2}[\/-]\d{1,2}\b/gi, '')
-      // Tanggal relatif + yang lain
+      // Tanggal relatif
       .replace(/\b(besok|lusa|minggu depan|minggu ini|bulan depan|hari ini|sekarang|tomorrow|next week|next month|today|kemarin)\b/gi, '')
-      .replace(/\b(setiap hari|setiap minggu|setiap bulan|daily|weekly|monthly|tiap minggu|tiap bulan)\b/gi, '')
       .replace(/\b(urgent|penting banget|kritis|darurat|penting|high|low|rendah|opsional|morning|afternoon|evening|night|pagi|siang|sore|malam)\b/gi, '')
       .replace(/\s+/g, ' ')
       .trim();
@@ -314,6 +405,9 @@ export class AiService {
       preferredMinutes,
       date,
       recurrence,
+      recurrenceRule,
+      recurrenceWeekday: recurrenceWeekdayP,
+      recurrenceMonthDay: recurrenceMonthDayP,
     };
   }
 }

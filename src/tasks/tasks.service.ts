@@ -12,9 +12,10 @@ export class TasksService {
       data: {
         userId,
         title: parsed.title || 'Untitled',
-        description: parsed.recurrence ? `Repeats: ${parsed.recurrence}` : undefined,
+        description: parsed.recurrenceRule ? `Repeats: ${parsed.recurrenceRule}` : undefined,
         durationMinutes: parsed.durationMinutes || 60,
         deadline: parsed.deadline ? new Date(parsed.deadline) : null,
+        recurrence: parsed.recurrenceRule,
         priority: (parsed.priority || 'NORMAL') as TaskPriority,
         status: TaskStatus.PENDING,
       },
@@ -46,6 +47,7 @@ export class TasksService {
         endTime: schedule.endTime,
         calendarEventId: schedule.calendarEventId,
         status: TaskStatus.SCHEDULED,
+        recurrence: task.recurrence, // recurring → event ini ikut RRULE
       },
     });
 

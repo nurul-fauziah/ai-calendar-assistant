@@ -1,5 +1,9 @@
 import { AiService } from './ai.service';
 import { ConfigService } from '@nestjs/config';
+import { format } from 'date-fns-tz';
+
+// Tanggal LOKAL user (Asia/Jakarta) — biar test relatif nggak patah saat hari berganti.
+const todayStr = (): string => format(new Date(), 'yyyy-MM-dd', { timeZone: 'Asia/Jakarta' });
 
 // Test only the regex fallback path (no LLM_API_KEY)
 describe('AiService regex fallback', () => {
@@ -155,14 +159,14 @@ describe('AiService regex fallback', () => {
   it('parses "besok meeting jam 10"', async () => {
     const r = await service.parseTask('besok meeting jam 10');
     expect(r.date).toBeDefined();
-    expect(r.date).not.toBe('2026-09-08'); // besok ≠ hari ini
+    expect(r.date).not.toBe(todayStr()); // besok ≠ hari ini
     expect(r.preferredMinutes).toBe(10 * 60);
     expect(r.title).toBe('meeting');
   });
 
   it('parses "hari ini makan jam 12"', async () => {
     const r = await service.parseTask('hari ini makan jam 12');
-    expect(r.date).toBe('2026-09-08'); // hari ini
+    expect(r.date).toBe(todayStr()); // hari ini
     expect(r.preferredMinutes).toBe(12 * 60);
     expect(r.title).toBe('makan');
   });
@@ -178,5 +182,65 @@ describe('AiService regex fallback', () => {
     const r = await service.parseTask('lusa ujian');
     expect(r.date).toBeDefined();
     expect(r.title).toBe('ujian');
+  });
+
+  describe('recurring tasks', () => {
+    it('"setiap senin jam 7 belajar bahasa Jepang 1 jam"', async () => {
+      const r = await service.parseTask('setiap senin jam 7 belajar bahasa Jepang 1 jam');
+      expect(r.intent).toBe('CREATE_TASK');
+      expect(r.recurrence).toBe('weekly');
+      expect(r.recurrenceRule).toBe('FREQ=WEEKLY;BYDAY=MO;BYHOUR=7;BYMINUTE=0');
+      expect(r.recurrenceWeekday).toBe(1); // Senin
+      expect(r.preferredMinutes).toBe(7 * 60);
+      expect(r.durationMinutes).toBe(60);
+      expect(r.title).toBe('belajar bahasa Jepang');
+      expect(r.title).not.toContain('setiap');
+      expect(r.title).not.toContain('senin');
+      expect(r.title).not.toContain('jam');
+      expect(r.date).toBeUndefined(); // recurring → no one-off date
+    });
+
+    it('"setiap hari jam 10 olahraga"', async () => {
+      const r = await service.parseTask('setiap hari jam 10 olahraga');
+      expect(r.recurrence).toBe('daily');
+      expect(r.recurrenceRule).toBe('FREQ=DAILY;BYHOUR=10;BYMINUTE=0');
+      expect(r.preferredMinutes).toBe(10 * 60);
+      expect(r.title).toBe('olahraga');
+      expect(r.date).toBeUndefined();
+    });
+
+    it('"setiap tanggal 1 bayar tagihan"', async () => {
+      const r = await service.parseTask('setiap tanggal 1 bayar tagihan');
+      expect(r.recurrence).toBe('monthly');
+      expect(r.recurrenceRule).toBe('FREQ=MONTHLY;BYMONTHDAY=1');
+      expect(r.recurrenceMonthDay).toBe(1);
+      expect(r.title).toBe('bayar tagihan');
+      expect(r.date).toBeUndefined();
+    });
+
+    it('"setiap minggu hari Jumat jam 8 meeting"', async () => {
+      const r = await service.parseTask('setiap minggu hari Jumat jam 8 meeting');
+      expect(r.recurrence).toBe('weekly');
+      expect(r.recurrenceRule).toBe('FREQ=WEEKLY;BYDAY=FR;BYHOUR=8;BYMINUTE=0');
+      expect(r.recurrenceWeekday).toBe(5); // Jumat
+      expect(r.preferredMinutes).toBe(8 * 60);
+      expect(r.title).toBe('meeting');
+      expect(r.title).not.toContain('Jumat');
+      expect(r.date).toBeUndefined();
+    });
+
+    it('"setiap hari Jumat" = weekly Friday, NOT daily', async () => {
+      const r = await service.parseTask('setiap hari Jumat jam 9 olahraga');
+      expect(r.recurrence).toBe('weekly'); // bukan daily
+      expect(r.recurrenceWeekday).toBe(5);
+      expect(r.recurrenceRule).toBe('FREQ=WEEKLY;BYDAY=FR;BYHOUR=9;BYMINUTE=0');
+      expect(r.title).toBe('olahraga');
+    });
+
+    it('metode langkah: "setiap senin jam 7 belajar bahasa Jepang 1 jam" pakai recurrence 1 jam', async () => {
+      const r = await service.parseTask('bayar tagihan bulanan');
+      expect(r.recurrence).toBe('monthly');
+      expect(r.recurrenceRule).toBe('FREQ=MONTHLY');
+    });
   });
 });

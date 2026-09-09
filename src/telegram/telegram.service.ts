@@ -160,6 +160,11 @@ export class TelegramService implements OnModuleInit {
         return this.schedulerService.continueModify(message.chat.id, user.id, text);
       }
 
+      // Lagi klarifikasi jam buat jadwal ulang → teks ini = jam mulainya.
+      if (this.schedulerService.hasPendingRecurTime(user.id)) {
+        return this.schedulerService.continueRecurTime(message.chat.id, user.id, text);
+      }
+
       // Parse task via AI, pake timezone user biar relatif (besok/hari ini)
       // nggak salah di zona server.
       const tz = await this.users.getTimezone(user.id);

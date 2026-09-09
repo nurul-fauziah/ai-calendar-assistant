@@ -13,6 +13,8 @@ export interface CalendarEvent {
   start: Date;
   end: Date;
   recurrence?: string[];
+  /** RFC-5545 RRULE string untuk task recurring. Diubah jadi ["RRULE:…"] saat kirim. */
+  rrule?: string;
 }
 
 @Injectable()
@@ -64,6 +66,18 @@ export class CalendarService {
     }
   }
 
+  /**
+   * Cek konflik occurrence PERTAMA dari jadwal recurring user terhadap
+   * event Google Calendar yang sudah ada di range tsb. Recurring task cuma
+   * nyetel occurrence pertama; kalau bentrok, user diminta pilih lain.
+   */
+  async checkRecurConflict(userId: string, start: Date, end: Date, tz = 'Asia/Jakarta'): Promise<boolean> {
+    const events = await this.getEvents(userId, start, end);
+    if (events.length === 0) return false;
+    const busyInstances = events.filter((e) => !(e.start.getTime() >= end.getTime() || e.end.getTime() <= start.getTime()));
+    return busyInstances.length > 0;
+  }
+
   async createEvent(userId: string, event: CalendarEvent) {
     try {
       const token = await this.getValidToken(userId);
@@ -75,6 +89,11 @@ export class CalendarService {
       const tz = await this.getTimezone(userId);
       const localStart = format(event.start, "yyyy-MM-dd'T'HH:mm:ss", { timeZone: tz });
       const localEnd = format(event.end, "yyyy-MM-dd'T'HH:mm:ss", { timeZone: tz });
+
+      // Recurring: kirim RRULE sebagai array RFC-5545. One-off: tanpa field.
+      const recurrence = event.rrule
+        ? [`RRULE:${event.rrule}`]
+        : event.recurrence;
 
       const res = await axios.post(
         'https://www.googleapis.com/calendar/v3/calendars/primary/events',
@@ -89,7 +108,7 @@ export class CalendarService {
             dateTime: localEnd,
             timeZone: tz,
           },
-          recurrence: event.recurrence,
+          recurrence,
         },
         {
           headers: { Authorization: `Bearer ${token}` },
