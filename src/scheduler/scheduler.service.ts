@@ -43,7 +43,7 @@ export class SchedulerService {
   // di-clear saat jawaban diterima / batal / reset.
   private pendingRecurTime = new Map<
     string,
-    { chatId: number; taskId: string; rrule: string }
+    { chatId: number; taskId: string; rrule: string; title: string }
   >();
 
   constructor(
@@ -86,9 +86,14 @@ export class SchedulerService {
     // Kalau user sebut hari spesifik ("besok", "senin"), start pencarian di
     // hari itu, bukan hari ini — biar "besok jam 1" nggak keburu recomm
     // slot hari ini dulu.
-    const searchStart = parsed.date
-      ? localDateToUtc(parsed.date, tz)
-      : now;
+    // Recurring task: search start = occurrence PERTAMA (next Rabu dst),
+    // BUKAN "sekarang / slot kosong pertama" — biar preview jatuh di hari
+    // pola yang bener ("setiap rabu" = Rabu, bukan Kamis).
+    const searchStart = parsed.recurrenceRule
+      ? this.firstOccurrenceForRule(parsed.recurrenceRule, tz)
+      : parsed.date
+        ? localDateToUtc(parsed.date, tz)
+        : now;
 
     const [events, dbEvents] = await Promise.all([
       this.calendar.getEvents(userId, now, searchEnd),
@@ -214,6 +219,7 @@ export class SchedulerService {
         chatId,
         taskId: existingTaskId ?? '',
         rrule: parsed.recurrenceRule,
+        title: parsed.title || 'Untitled',
       });
       await this.telegramService.sendText(
         chatId,
@@ -318,7 +324,7 @@ export class SchedulerService {
         },
       });
     } catch (err) {
-      const code = (err as any)?.code;
+      const code = (err as { code?: string })?.code;
       if (code === 'P2002') {
         sched = await this.prisma.scheduledTask.findFirst({
           where: { userId, taskId: task.id, status: 'PENDING' },
@@ -437,6 +443,7 @@ export class SchedulerService {
       chatId,
       `✅ Jadwal dikonfirmasi!\n\n` +
         `📌 ${escapeHtml(task.title)}\n` +
+        (sched.recurrence ? `🔁 ${this.describeRecurrence(sched.recurrence)}\n` : '') +
         `${format(toLocal(sched.startTime, tz), 'EEE, dd MMM', { locale: idLocale })}\n` +
         `${format(toLocal(sched.startTime, tz), 'HH:mm')} – ${format(toLocal(sched.endTime, tz), 'HH:mm')}\n\n` +
         escapeHtml(calendarMsg),
@@ -651,8 +658,11 @@ export class SchedulerService {
     }
 
     const tz = await this.getTimezone(userId);
-    const asked = await this.aiService.parseTask(text, tz);
-    if (asked.preferredMinutes === undefined) {
+
+    // Parse jam dari text user. Pakai mode "recurring" (strict) biar
+    // "jam 7" = 07:00, bukan 19:00.
+    const preferredMinutes = this.parseTimeForRecurring(text);
+    if (preferredMinutes === undefined) {
       await this.telegramService.sendText(
         chatId,
         'Jam mulainya yang mana? Contoh: <code>jam 7 pagi</code> atau <code>15.30</code>.',
@@ -662,7 +672,7 @@ export class SchedulerService {
 
     const rule = pending.rrule.replace(
       /(;BYHOUR=\d+;BYMINUTE=\d+)?$/,
-      `;BYHOUR=${Math.floor(asked.preferredMinutes / 60)};BYMINUTE=${asked.preferredMinutes % 60}`,
+      `;BYHOUR=${Math.floor(preferredMinutes / 60)};BYMINUTE=${preferredMinutes % 60}`,
     );
     let task = pending.taskId
       ? await this.prisma.task.findUnique({ where: { id: pending.taskId } })
@@ -670,12 +680,12 @@ export class SchedulerService {
 
     const parsed: ParsedTask = {
       intent: 'CREATE_TASK',
-      title: task?.title || 'Untitled',
+      title: pending.title,
       durationMinutes: task?.durationMinutes ?? SchedulerService.DEFAULT_DURATION_MINUTES,
-      preferredMinutes: asked.preferredMinutes,
+      preferredMinutes,
       recurrenceRule: rule,
     };
-    const parsedFull = { ...parsed, title: task?.title || 'Untitled' };
+    const parsedFull = { ...parsed, title: pending.title };
 
     // Kalau task belum ada (baru ambiguous recurring diawal), bikin sekarang.
     if (!task) {
@@ -706,6 +716,48 @@ export class SchedulerService {
     }
 
     await this.sendRecommendation(chatId, userId, parsedFull, [slot], task.id);
+  }
+
+  // Parse waktu untuk konteks recurring (strict): "jam 7" = 07:00, "jam 7 pagi" = 07:00,
+  // "jam 7 malam" = 19:00, "15.30" = 15:30, "jam 3 sore" = 15:00.
+  private parseTimeForRecurring(text: string): number | undefined {
+    const lower = text.toLowerCase().trim();
+
+    // Helper: resolve jam/menit + periode ke menit absolut (0-1439).
+    // strict = true → nggak geser 1-7 ke PM.
+    const resolveTime = (hRaw: number, mRaw: number | undefined, period?: string): number | undefined => {
+      if (hRaw > 24 || (mRaw !== undefined && mRaw >= 60)) return undefined;
+      let h = hRaw;
+      if (mRaw !== undefined) {
+        // Menit eksplisit = jam sudah pasti.
+      } else if (period === 'siang' || period === 'sore' || period === 'malam') {
+        // Tanpa menit + periode: "jam 1 siang"=13, "jam 3 sore"=15, "jam 8 malam"=20.
+        if (h <= 11) h += 12;
+      }
+      // strict mode: nggak geser 1-7 ke PM.
+      return h * 60 + (mRaw || 0);
+    };
+
+    // Bentuk 1: "jam 7", "jam 7 pagi", "pukul 15", "jam 15.30", "jam 3 sore"
+    const prefixMatch = /\b(?:jam|pukul)\s+(\d{1,2})(?:\s*[:.]\s*(\d{1,2}))?\s*(pagi|siang|sore|malam)?/i.exec(text);
+    if (prefixMatch) {
+      return resolveTime(
+        parseInt(prefixMatch[1], 10),
+        prefixMatch[2] !== undefined ? parseInt(prefixMatch[2], 10) : undefined,
+        prefixMatch[3],
+      );
+    }
+
+    // Bentuk 2: "15.30", "07:00" (bare time)
+    const bareMatch = /(?<![\d:.])(\d{1,2})\s*[:.]\s*(\d{1,2})(?!\s*(?:jam|pukul))/i.exec(text);
+    if (bareMatch) {
+      return resolveTime(
+        parseInt(bareMatch[1], 10),
+        parseInt(bareMatch[2], 10),
+      );
+    }
+
+    return undefined;
   }
 
   // Human-readable label dari RRULE buat pesan rekomendasi.
@@ -767,11 +819,12 @@ export class SchedulerService {
     } else if (monthDay) {
       // Hari (local) di bulan ini, clip 29-31 Feb/Apr dst. String tanggal biar
       // format lokal user konsisten, bukan mutasi host-local.
+      const mday = +monthDay;
       const monthDayOf = (d: Date) => {
         const y = +format(d, 'yyyy', { timeZone: tz });
         const m = +format(d, 'MM', { timeZone: tz });
         const last = new Date(Date.UTC(y, m, 0)).getUTCDate();
-        return `${y}-${String(m).padStart(2, '0')}-${String(Math.min(monthDay, last)).padStart(2, '0')}`;
+        return `${y}-${String(m).padStart(2, '0')}-${String(Math.min(mday, last)).padStart(2, '0')}`;
       };
       let cand = monthDayOf(today);
       if (cand < format(today, 'yyyy-MM-dd', { timeZone: tz })) {

@@ -28,6 +28,7 @@ describe('SchedulerService', () => {
   const calendar = {
     getEvents: jest.fn().mockResolvedValue([]),
     createEvent: jest.fn().mockResolvedValue({}),
+    checkRecurConflict: jest.fn().mockResolvedValue(false),
   };
   const telegram = {
     sendText: jest.fn().mockResolvedValue(undefined),
@@ -44,7 +45,7 @@ describe('SchedulerService', () => {
         { provide: PrismaService, useValue: prisma },
         { provide: CalendarService, useValue: calendar },
         { provide: TelegramService, useValue: telegram },
-        { provide: TasksService, useValue: { createTask: jest.fn() } },
+        { provide: TasksService, useValue: { createTask: jest.fn().mockResolvedValue({ id: 't-new', title: 'jajan', durationMinutes: 60 }) } },
         {
           provide: AiService,
           useValue: {
@@ -335,5 +336,149 @@ describe('SchedulerService', () => {
     const ai = new AiService({ get: jest.fn(() => undefined) } as any);
     const result = await ai.parseTask('pindah jam 15.50');
     expect(result.preferredMinutes).toBe(15 * 60 + 50);
+  });
+
+  describe('recurring occurrence day', () => {
+    // "setiap rabu jajan jam 15.30" → preview harus RABU (bukan Kamis)
+    // & di 15:30, dihitung dari occurrence pertama RRULE.
+    it('findAvailableSlots seeds on the recurrence weekday, not first free slot', async () => {
+      jest.useFakeTimers();
+      // Kamis 2026-09-10 03:00Z (10:00 WIB), pagi — next Rabu = 2026-09-16.
+      jest.setSystemTime(Date.parse('2026-09-10T03:00:00.000Z'));
+      try {
+        prisma.scheduledTask.findMany.mockResolvedValue([]);
+        const slots = await service.findAvailableSlots('user-1', {
+          intent: 'CREATE_TASK',
+          title: 'jajan',
+          recurrenceRule: 'FREQ=WEEKLY;BYDAY=WE;BYHOUR=15;BYMINUTE=30',
+          preferredMinutes: 15 * 60 + 30,
+        });
+        expect(slots.length).toBeGreaterThan(0);
+        const first = slots[0];
+        // Rabu (getDay 3) di zona WIB.
+        expect(first.start.getUTCDay()).toBe(3); // Rabu (UTC==WIB offset utk jam segini)
+        // 15:30 WIB = 08:30Z = 510.
+        const utcMin = first.start.getUTCHours() * 60 + first.start.getUTCMinutes();
+        expect(utcMin).toBe(8 * 60 + 30);
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+
+    it('first occurrence of weekly "setiap rabu" lands mid-next-week, not same-day-if-zero-diff', async () => {
+      // Kamis → next Rabu; kalau "hari ini Rabu & udah lewat", lompat minggu depan.
+      jest.useFakeTimers();
+      jest.setSystemTime(Date.parse('2026-09-10T03:00:00.000Z')); // Kamis
+      try {
+        const occ = (service as any).firstOccurrenceForRule(
+          'FREQ=WEEKLY;BYDAY=WE;BYHOUR=15;BYMINUTE=30',
+          'Asia/Jakarta',
+        );
+        expect(occ.getUTCDay()).toBe(3); // Rabu
+        expect(occ.toISOString().slice(0, 10)).toBe('2026-09-16');
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+  });
+
+  describe('recurring time clarification flow', () => {
+    // User: "setiap kamis jajan" → bot asks time → User: "jam 7"
+    // Harus complete task pending dengan title "jajan", recurrence Kamis, jam 07:00.
+    it('continues pending recurring task when user provides time', async () => {
+      jest.useFakeTimers();
+      // Rabu 2026-09-09 03:00Z (10:00 WIB) → next Kamis = 2026-09-10.
+      jest.setSystemTime(Date.parse('2026-09-09T03:00:00.000Z'));
+      try {
+        // Wire lazy telegramService (needed for continueRecurTime to send messages)
+        await service['onModuleInit']();
+        // Setup: pendingRecurTime already set (simulating first message "setiap kamis jajan")
+        service['pendingRecurTime'].set('user-1', {
+          chatId: 999,
+          taskId: '',
+          rrule: 'FREQ=WEEKLY;BYDAY=TH',
+          title: 'jajan',
+        });
+        prisma.scheduledTask.findMany.mockResolvedValue([]);
+
+        // User replies with just the time
+        await service.continueRecurTime(999, 'user-1', 'jam 7');
+
+        // Should create task with correct title & recurrence (via TasksService.createTask)
+        const tasksService = module.get(TasksService);
+        expect(tasksService.createTask).toHaveBeenCalledWith('user-1', expect.objectContaining({
+          title: 'jajan',
+          recurrenceRule: 'FREQ=WEEKLY;BYDAY=TH;BYHOUR=7;BYMINUTE=0',
+        }));
+
+        // Should send recommendation with correct occurrence
+        expect(telegram.sendRecommendation).toHaveBeenCalled();
+        // pendingRecurTime cleared
+        expect(service.hasPendingRecurTime('user-1')).toBe(false);
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+
+    it('parses "jam 7" as 07:00 (strict, not 19:00)', async () => {
+      const minutes = (service as any).parseTimeForRecurring('jam 7');
+      expect(minutes).toBe(7 * 60);
+    });
+
+    it('parses "jam 7 pagi" as 07:00', async () => {
+      const minutes = (service as any).parseTimeForRecurring('jam 7 pagi');
+      expect(minutes).toBe(7 * 60);
+    });
+
+    it('parses "jam 7 malam" as 19:00', async () => {
+      const minutes = (service as any).parseTimeForRecurring('jam 7 malam');
+      expect(minutes).toBe(19 * 60);
+    });
+
+    it('parses "jam 15.30" as 15:30', async () => {
+      const minutes = (service as any).parseTimeForRecurring('jam 15.30');
+      expect(minutes).toBe(15 * 60 + 30);
+    });
+
+    it('parses "jam 3 sore" as 15:00', async () => {
+      const minutes = (service as any).parseTimeForRecurring('jam 3 sore');
+      expect(minutes).toBe(15 * 60);
+    });
+
+    it('parses bare "15.30" as 15:30', async () => {
+      const minutes = (service as any).parseTimeForRecurring('15.30');
+      expect(minutes).toBe(15 * 60 + 30);
+    });
+
+    it('parses bare "07:00" as 07:00', async () => {
+      const minutes = (service as any).parseTimeForRecurring('07:00');
+      expect(minutes).toBe(7 * 60);
+    });
+
+    it('keeps pending state when time is invalid', async () => {
+      await service['onModuleInit']();
+      service['pendingRecurTime'].set('user-1', {
+        chatId: 999,
+        taskId: '',
+        rrule: 'FREQ=WEEKLY;BYDAY=TH',
+        title: 'jajan',
+      });
+      await service.continueRecurTime(999, 'user-1', 'bukan jam');
+      expect(service.hasPendingRecurTime('user-1')).toBe(true);
+      expect(telegram.sendText).toHaveBeenCalledWith(999, expect.stringContaining('Jam mulainya'));
+    });
+
+    it('clears pending on "batal"', async () => {
+      await service['onModuleInit']();
+      service['pendingRecurTime'].set('user-1', {
+        chatId: 999,
+        taskId: '',
+        rrule: 'FREQ=WEEKLY;BYDAY=TH',
+        title: 'jajan',
+      });
+      await service.continueRecurTime(999, 'user-1', 'batal');
+      expect(service.hasPendingRecurTime('user-1')).toBe(false);
+      expect(telegram.sendText).toHaveBeenCalledWith(999, 'Oke, jadwal ulang dibatalkan.');
+    });
   });
 });

@@ -242,5 +242,30 @@ describe('AiService regex fallback', () => {
       expect(r.recurrence).toBe('monthly');
       expect(r.recurrenceRule).toBe('FREQ=MONTHLY');
     });
+
+    it('"setiap rabu jajan jam 15.30" → weekly Wednesday 15:30', async () => {
+      const r = await service.parseTask('setiap rabu jajan jam 15.30');
+      expect(r.intent).toBe('CREATE_TASK');
+      expect(r.recurrence).toBe('weekly');
+      expect(r.recurrenceRule).toBe('FREQ=WEEKLY;BYDAY=WE;BYHOUR=15;BYMINUTE=30');
+      expect(r.recurrenceWeekday).toBe(3); // Rabu
+      expect(r.preferredMinutes).toBe(15 * 60 + 30);
+      expect(r.title).toBe('jajan');
+      expect(r.date).toBeUndefined();
+    });
+
+    it('"setiap senin belajar Python jam 07.00" → 07:00 (pagi, strict)', async () => {
+      const r = await service.parseTask('setiap senin belajar Python jam 07.00');
+      expect(r.recurrenceRule).toBe('FREQ=WEEKLY;BYDAY=MO;BYHOUR=7;BYMINUTE=0');
+      expect(r.preferredMinutes).toBe(7 * 60);
+      expect(r.title).toBe('belajar Python');
+    });
+
+    it('"setiap jumat meeting jam 10" → 10:00 Jumat', async () => {
+      const r = await service.parseTask('setiap jumat meeting jam 10');
+      expect(r.recurrenceRule).toBe('FREQ=WEEKLY;BYDAY=FR;BYHOUR=10;BYMINUTE=0');
+      expect(r.recurrenceWeekday).toBe(5);
+      expect(r.title).toBe('meeting');
+    });
   });
 });
